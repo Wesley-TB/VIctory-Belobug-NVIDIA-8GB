@@ -701,7 +701,7 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
 /// the title's first look at it after (`P`: array, when written, when
 /// seen), every file opened (`F`), and each second what the title's mapping
 /// calls cost (`M`, `xmem::map_costs`). Times are milliseconds since the
-/// Unix epoch.
+/// Unix epoch. A failed request flushes the log before its status is published.
 pub(crate) mod stream_log {
     use super::*;
     use std::io::Write;
@@ -752,9 +752,22 @@ pub(crate) mod stream_log {
             return;
         }
         let now = now();
+        if let Some(log) = log() {
+            let _ = write_request(&mut *log.lock().unwrap_or_else(|e| e.into_inner()), job, started, now, result);
+        }
+    }
+
+    pub(super) fn write_request(
+        log: &mut impl Write,
+        job: &Job,
+        started: std::time::Instant,
+        now: u64,
+        result: &Result<(), HRESULT>,
+    ) -> std::io::Result<()> {
         let ago = |t: Option<std::time::Instant>| now - t.map_or(0, |t| t.elapsed().as_millis() as u64);
         let r = &job.request;
-        line(format_args!(
+        writeln!(
+            log,
             "R\t{}\t{}\t{:x}\t{}\t{}\t{}\t{:x}\t{}\t{}\t{}\t{now}\t{:x}",
             job.lane,
             job.seq,
@@ -767,7 +780,11 @@ pub(crate) mod stream_log {
             ago(job.note.submitted),
             ago(Some(started)),
             result.err().unwrap_or(0)
-        ));
+        )?;
+        if result.is_err() {
+            log.flush()?;
+        }
+        Ok(())
     }
 }
 
@@ -1959,6 +1976,39 @@ mod tests {
         void(queue, 0x30);
         assert_eq!(wait(array, 0), S_OK);
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn a_failed_request_flushes_the_streaming_log() {
+        let source = [14u8, 15];
+        let mut out = [0u8];
+        let mut job = Job {
+            lane: 7,
+            seq: 1,
+            request: request(MEMORY_SOURCE, out.as_mut_ptr().cast(), 1, source.as_ptr().cast(), 0, 1),
+            note: Note::default(),
+            staging: 0,
+        };
+        let mut log = std::io::BufWriter::with_capacity(1024, Vec::new());
+        let started = Instant::now();
+        let result = execute(&job.request);
+        assert_eq!(result, Ok(()));
+        stream_log::write_request(&mut log, &job, started, stream_log::now(), &result).unwrap();
+        assert!(log.get_ref().is_empty());
+
+        job.seq = 2;
+        job.request.source_size = 2;
+        let started = Instant::now();
+        let result = execute(&job.request);
+        assert_eq!(result, Err(E_INVALIDARG));
+        stream_log::write_request(&mut log, &job, started, stream_log::now(), &result).unwrap();
+
+        let mut rows = std::str::from_utf8(log.get_ref()).unwrap().lines();
+        let success = rows.next().expect("the earlier buffered success record");
+        assert!(success.starts_with("R\t7\t1\t") && success.ends_with("\t0"));
+        let failure = rows.next().expect("the failed request record");
+        assert!(failure.starts_with("R\t7\t2\t") && failure.ends_with("\t80070057"));
+        assert_eq!(rows.next(), None);
     }
 
     #[test]
