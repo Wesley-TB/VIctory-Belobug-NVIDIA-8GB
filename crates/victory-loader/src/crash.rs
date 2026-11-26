@@ -695,18 +695,19 @@ pub(crate) fn unwind_into(
         if rsp < low || rsp.checked_add(8).is_none_or(|end| end > high) {
             break;
         }
-        // With checks, code must be executable. Code outside an image (our
-        // thunks and stubs, made with `VirtualAlloc`) has no unwind data and
-        // is only taken at the first frame, by the leaf rule below.
+        // With checks, code past the first frame must be executable image code.
+        // The first frame takes the leaf rule below whatever RIP points at: our
+        // thunks and stubs (made with `VirtualAlloc`, no unwind data), and a
+        // call through a null or bad pointer, whose caller is the useful line
+        // in a crash report. The next step checks the RIP it recovers.
         let code_image = if checks {
-            let Some(region) = readable_region(context.Rip as usize) else {
-                break;
-            };
-            let in_image = region.Type == MEM_IMAGE;
-            if !executable(&region) || (!in_image && frames.len() != 1) {
-                break;
+            match readable_region(context.Rip as usize) {
+                Some(region) if executable(&region) && region.Type == MEM_IMAGE => {
+                    Some(region.AllocationBase as usize)
+                }
+                _ if frames.len() == 1 => None,
+                _ => break,
             }
-            in_image.then_some(region.AllocationBase as usize)
         } else {
             None
         };
@@ -755,7 +756,9 @@ pub(crate) fn unwind_into(
                 )
             };
         }
-        if context.Rip == 0 || (checks && (context.Rsp <= rsp as u64 || context.Rsp >= high as u64))
+        // RSP may reach `high` (the caller's return address was the stack's
+        // last word): the caller is kept, and the next step stops at the bound.
+        if context.Rip == 0 || (checks && (context.Rsp <= rsp as u64 || context.Rsp > high as u64))
         {
             break;
         }
@@ -1171,17 +1174,34 @@ mod tests {
     }
 
     #[test]
-    fn stops_at_a_pc_outside_an_image() {
+    fn takes_the_caller_of_a_call_through_a_null_pointer() {
         let pc = unwinds_like_the_system_walk as *const () as u64;
-        let stack = [pc, pc];
+        // The return address is the stack's last word: the caller is kept,
+        // and the walk stops there.
+        let stack = [pc];
         let low = stack.as_ptr() as usize;
         // SAFETY: zeroed is a valid CONTEXT. Only RIP and RSP are used in this test.
         let mut context: CONTEXT = unsafe { std::mem::zeroed() };
-        context.Rip = low as u64;
         context.Rsp = low as u64;
         let mut frames = Vec::with_capacity(MAX_FRAMES);
         unwind_into(context, low, low + size_of_val(&stack), &mut frames, true);
-        assert_eq!(frames, [low as u64]);
+        assert_eq!(frames, [0, pc]);
+    }
+
+    #[test]
+    fn stops_at_a_pc_outside_an_image_after_the_first_frame() {
+        // The leaf rule at the first frame returns into data on the stack:
+        // readable, but not executable and not an image.
+        let data = [0u64; 1];
+        let target = data.as_ptr() as u64;
+        let stack = [target, target];
+        let low = stack.as_ptr() as usize;
+        // SAFETY: zeroed is a valid CONTEXT. Only RIP and RSP are used in this test.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        context.Rsp = low as u64;
+        let mut frames = Vec::with_capacity(MAX_FRAMES);
+        unwind_into(context, low, low + size_of_val(&stack), &mut frames, true);
+        assert_eq!(frames, [0, target]);
     }
 
     #[test]
