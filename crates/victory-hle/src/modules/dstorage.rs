@@ -701,7 +701,8 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
 /// the title's first look at it after (`P`: array, when written, when
 /// seen), every file opened (`F`), and each second what the title's mapping
 /// calls cost (`M`, `xmem::map_costs`). Times are milliseconds since the
-/// Unix epoch. A failed request flushes the log before its status is published.
+/// Unix epoch. Failed requests and statuses carrying a failure flush the log
+/// before the corresponding completion is published.
 pub(crate) mod stream_log {
     use super::*;
     use std::io::Write;
@@ -755,6 +756,32 @@ pub(crate) mod stream_log {
         if let Some(log) = log() {
             let _ = write_request(&mut *log.lock().unwrap_or_else(|e| e.into_inner()), job, started, now, result);
         }
+    }
+
+    pub(super) fn status(status: &Status, seq: u64, failed: bool) {
+        if !on() {
+            return;
+        }
+        let at = now();
+        if let Some(log) = log() {
+            let mut log = log.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = write_status(&mut *log, status, seq, at, failed);
+        }
+        status.written().store(at, Ordering::Relaxed);
+    }
+
+    pub(super) fn write_status(
+        log: &mut impl Write,
+        status: &Status,
+        seq: u64,
+        at: u64,
+        failed: bool,
+    ) -> std::io::Result<()> {
+        writeln!(log, "S\t{:x}\t{seq}\t{}\t{at}", status.array as usize, status.enqueued)?;
+        if failed {
+            log.flush()?;
+        }
+        Ok(())
     }
 
     pub(super) fn write_request(
@@ -893,7 +920,7 @@ impl Lanes {
             if let Err(hr) = result {
                 lane.failures.insert(job.seq, hr);
             }
-            lane.flush();
+            lane.flush(stream_log::status);
         }
     }
 
@@ -930,7 +957,7 @@ impl Lanes {
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
             }
         }
-        lane.flush();
+        lane.flush(stream_log::status);
     }
 }
 
@@ -955,7 +982,7 @@ impl Lane {
     }
 
     /// Writes the status entries whose earlier reads have all finished.
-    fn flush(&mut self) {
+    fn flush(&mut self, mut log_status: impl FnMut(&Status, u64, bool)) {
         while let Some(&(seq, _)) = self.statuses.front() {
             let waiting = self.reads.front().map(|r| r.0);
             if waiting.into_iter().chain(self.running.first().copied()).any(|s| s < seq) {
@@ -968,11 +995,7 @@ impl Lane {
             let first = std::mem::replace(&mut self.failures, later)
                 .into_values()
                 .next();
-            if stream_log::on() {
-                let at = stream_log::now();
-                stream_log::line(format_args!("S\t{:x}\t{seq}\t{}\t{at}", status.array as usize, status.enqueued));
-                status.written().store(at, Ordering::Relaxed);
-            }
+            log_status(&status, seq, first.is_some());
             status
                 .entry()
                 .store(first.unwrap_or(S_OK), Ordering::Release);
@@ -2009,6 +2032,35 @@ mod tests {
         let failure = rows.next().expect("the failed request record");
         assert!(failure.starts_with("R\t7\t2\t") && failure.ends_with("\t80070057"));
         assert_eq!(rows.next(), None);
+    }
+
+    #[test]
+    fn a_failed_status_flushes_the_streaming_log_before_completion() {
+        let array: Array = status_array(2).cast();
+        let mut lane = Lane::new(0, 4);
+        for (index, seq) in [(0, 1), (1, 3)] {
+            add_ref_instance(array);
+            let status = Status { array, index, enqueued: 10 };
+            status.entry().store(E_PENDING, Ordering::Release);
+            lane.statuses.push_back((seq, status));
+        }
+        lane.failures.insert(2, E_INVALIDARG);
+
+        let mut log = std::io::BufWriter::with_capacity(1024, Vec::new());
+        let address = array as usize;
+        let expected = format!("S\t{address:x}\t1\t10\t20\nS\t{address:x}\t3\t10\t20\n");
+        lane.flush(|status, seq, failed| {
+            stream_log::write_status(&mut log, status, seq, 20, failed).unwrap();
+            assert_eq!(status_result(array, status.index), E_PENDING);
+            if status.index == 0 {
+                assert!(log.get_ref().is_empty());
+            } else {
+                assert_eq!(log.get_ref(), expected.as_bytes());
+            }
+        });
+        assert_eq!(status_result(array, 0), S_OK);
+        assert_eq!(status_result(array, 1), E_INVALIDARG);
+        release(array);
     }
 
     #[test]
