@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -74,8 +74,16 @@ pub fn run(paths: Vec<PathBuf>, strict: bool, list_missing: bool) -> Result<()> 
                 }
             };
             let path = entry.path();
-            if !entry.file_type().is_file() || !looks_like_pe(path) {
+            if !entry.file_type().is_file() {
                 continue;
+            }
+            match looks_like_pe(path) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    failed.push(format!("{}: reading PE signature: {error}", path.display()));
+                    continue;
+                }
             }
             // Use the resolved path for deduplication and keep the original for output.
             let identity = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
@@ -138,12 +146,13 @@ pub fn run(paths: Vec<PathBuf>, strict: bool, list_missing: bool) -> Result<()> 
 
 /// Cheap pre-filter: an `MZ` header, regardless of extension (console
 /// packages do not always use .exe/.dll).
-fn looks_like_pe(path: &Path) -> bool {
+fn looks_like_pe(path: &Path) -> io::Result<bool> {
     let mut magic = [0u8; 2];
-    std::fs::File::open(path)
-        .and_then(|mut f| f.read_exact(&mut magic))
-        .is_ok()
-        && &magic == b"MZ"
+    match std::fs::File::open(path)?.read_exact(&mut magic) {
+        Ok(()) => Ok(&magic == b"MZ"),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn tally_image(
@@ -223,6 +232,25 @@ mod tests {
             has_exception_table: false,
             has_load_config: false,
             codeview: None,
+        }
+    }
+
+    #[test]
+    fn pe_probe_distinguishes_non_images_from_read_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("input");
+        assert_eq!(
+            looks_like_pe(&path).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        for (bytes, expected) in [
+            (b"".as_slice(), false),
+            (b"M".as_slice(), false),
+            (b"NO".as_slice(), false),
+            (b"MZ".as_slice(), true),
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            assert_eq!(looks_like_pe(&path).unwrap(), expected);
         }
     }
 
