@@ -113,7 +113,8 @@ pub(crate) struct Replay {
     #[arg(long)]
     draws: Option<String>,
     /// Say which lists (with --lists: commands) change words of buffers:
-    /// `<resource>:<offset>:<bytes>` (hexadecimal; repeatable).
+    /// `<resource>:<offset>:<bytes>` (decimal or 0x resource ID, hexadecimal
+    /// offset and size; repeatable).
     #[arg(long)]
     watch: Vec<String>,
     /// With --diverge-picture and one list in --lists: its commands (`0..900`)
@@ -242,6 +243,24 @@ fn range(text: &str) -> Option<(u32, u32)> {
 fn pair(text: &str, by: char) -> Option<(u32, u32)> {
     let (a, b) = text.split_once(by)?;
     Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+}
+
+fn parse_watch(text: &str) -> Option<(u32, u64, u64)> {
+    let mut fields = text.split(':').map(str::trim);
+    let resource = fields.next()?;
+    let prefix = |c: &str| c.starts_with("0x") || c.starts_with("0X");
+    let id = if prefix(resource) {
+        u32::from_str_radix(&resource[2..], 16).ok()?
+    } else {
+        resource.parse().ok()?
+    };
+    let hex = |field: &str| {
+        let digits = if prefix(field) { &field[2..] } else { field };
+        u64::from_str_radix(digits, 16).ok()
+    };
+    let offset = hex(fields.next()?)?;
+    let bytes = hex(fields.next()?)?;
+    fields.next().is_none().then_some((id, offset, bytes))
 }
 
 pub(crate) fn run(r: Replay) -> Result<()> {
@@ -385,21 +404,9 @@ pub(crate) fn run(r: Replay) -> Result<()> {
     }
     let mut watched = Vec::new();
     for text in &r.watch {
-        let mut n = text
-            .split(':')
-            .map(|p| u64::from_str_radix(p.trim_start_matches("0x"), 16));
-        let mut next = || {
-            n.next()
-                .and_then(Result::ok)
-                .with_context(|| format!("--watch {text}"))
-        };
-        let id = text
-            .split(':')
-            .next()
-            .and_then(|p| p.parse().ok())
-            .with_context(|| format!("--watch {text}"))?;
-        let _ = next();
-        watched.push((id, next()?, next()?));
+        watched.push(parse_watch(text).with_context(|| {
+            format!("--watch {text}: expected <resource>:<hex offset>:<hex bytes>")
+        })?);
     }
     if let Some(runs) = r
         .diverge
@@ -521,6 +528,15 @@ mod tests {
         for pace in ["0", "0.125"] {
             let arg = format!("--pace={pace}");
             assert!(crate::Cli::try_parse_from(["victory", "replay", "missing", &arg]).is_ok());
+        }
+    }
+
+    #[test]
+    fn watch_ranges_keep_decimal_ids_and_accept_explicit_hex_ids() {
+        assert_eq!(super::parse_watch("10:10:4"), Some((10, 16, 4)));
+        assert_eq!(super::parse_watch("0XA:0x20:0X10"), Some((10, 32, 16)));
+        for invalid in ["10:10", "10:10:4:8", "0x100000000:0:4", ":0:4"] {
+            assert_eq!(super::parse_watch(invalid), None);
         }
     }
 
