@@ -4359,6 +4359,45 @@ fn buffer_uav(
     Some(Some(shadow.buffer.clone()))
 }
 
+/// Whether typed unordered access views in `format` are supported by the host
+/// device (`D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW`).
+fn supports_typed_uav(format: u32) -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+    const UNKNOWN: u8 = 0;
+    const UNSUPPORTED: u8 = 1;
+    const SUPPORTED: u8 = 2;
+    static CACHE: [AtomicU8; 256] = [const { AtomicU8::new(UNKNOWN) }; 256];
+
+    if let Some(slot) = CACHE.get(format as usize) {
+        match slot.load(Relaxed) {
+            SUPPORTED => return true,
+            UNSUPPORTED => return false,
+            _ => {}
+        }
+    }
+    let Some(host) = host() else {
+        return true;
+    };
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    // SAFETY: a plain query into our own structure on a live device.
+    let ok = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut support).cast(),
+            size_of_val(&support) as u32,
+        )
+    }
+    .is_ok()
+        && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0;
+    if let Some(slot) = CACHE.get(format as usize) {
+        slot.store(if ok { SUPPORTED } else { UNSUPPORTED }, Relaxed);
+    }
+    ok
+}
+
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
@@ -4400,8 +4439,20 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         format.0 = linear as i32;
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
+    let allow_uav = |effective: u32| -> bool {
+        if unordered && !supports_typed_uav(effective) {
+            once!(
+                effective,
+                view,
+                own,
+                "unordered access view format the host does not support"
+            );
+            return false;
+        }
+        true
+    };
     if view == 0 {
-        return !typeless;
+        return !typeless && allow_uav(own);
     }
     // A view of a target whose format the host refuses, in the title's
     // format: in the stand-in the host copy has.
@@ -4409,18 +4460,21 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         if let Some(format) = format {
             *format = d.Format;
         }
-        return true;
+        return allow_uav(own);
     }
     if family(view) != family(own) {
         once!(view, own, "view format of another family");
         return false;
     }
-    if let Some(format) = format
-        && !typeless
-    {
-        *format = d.Format;
-    }
-    true
+    let effective = if typeless {
+        view
+    } else {
+        if let Some(format) = format {
+            *format = d.Format;
+        }
+        own
+    };
+    allow_uav(effective)
 }
 
 /// The title's unordered access view of a depth texture, as a view of the
@@ -5880,6 +5934,80 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         };
         let view = View::Unordered(0, 0, Some([28, 8, 0, 0, 0, 0, 0, 0, 0, 0]));
         null_for(&view, heap.cpu(0));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// Typed UAVs whose effective view format lacks host typed-UAV support
+    /// are refused by `fits` before hitting `CreateUnorderedAccessView`.
+    #[test]
+    fn unsupported_typed_uav_format_is_rejected() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let props = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let make_tex = |format: u32| -> Option<ID3D12Resource> {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 4,
+                Height: 4,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT(format as i32),
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut resource: Option<ID3D12Resource> = None;
+            // SAFETY: valid device and resource descriptor for a 4x4 texture.
+            unsafe {
+                host.device.CreateCommittedResource(
+                    &props,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut resource,
+                )
+            }
+            .ok()?;
+            resource
+        };
+
+        let Some(rgba8_typeless) = make_tex(27) else {
+            return;
+        };
+        let mut typeless_fmt = DXGI_FORMAT(27);
+        assert!(!fits(&rgba8_typeless, Some(&mut typeless_fmt), true));
+
+        let mut unorm_fmt = DXGI_FORMAT(28);
+        assert!(fits(&rgba8_typeless, Some(&mut unorm_fmt), true));
+        let uav_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: unorm_fmt,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        // SAFETY: `fits` confirmed typed UAV support for `unorm_fmt` on this resource.
+        unsafe {
+            host.device
+                .CreateUnorderedAccessView(&rgba8_typeless, None, Some(&uav_desc), heap.cpu(0));
+        }
+
+        if let Some(bgrx_typeless) = make_tex(92) {
+            let mut bgrx_unorm = DXGI_FORMAT(88);
+            assert!(!supports_typed_uav(88));
+            assert!(!fits(&bgrx_typeless, Some(&mut bgrx_unorm), true));
+        }
+
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
