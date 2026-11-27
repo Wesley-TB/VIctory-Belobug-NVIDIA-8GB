@@ -1785,7 +1785,11 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     if let Some(limit) = limit {
         return filled < limit;
     }
-    let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
+    // `VICTORY_TEXTURE_STRICT_BUDGET=1` (8 GB cards, `-LowVram`): no floor
+    // admitted before the budget is checked, and 1 GiB without a budget.
+    static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let strict = *STRICT.get_or_init(|| std::env::var("VICTORY_TEXTURE_STRICT_BUDGET").is_ok_and(|v| v.trim() == "1"));
+    let floor = if strict { 0 } else { texture_floor_bytes(memory.map(|[budget, ..]| budget)) };
     if filled < floor {
         return true;
     }
@@ -1798,7 +1802,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
             used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
                 < budget / 100 * room_percent()
         }
-        None => filled < WITHOUT_BUDGET,
+        None => filled < if strict { 1 << 30 } else { WITHOUT_BUDGET },
     }
 }
 
