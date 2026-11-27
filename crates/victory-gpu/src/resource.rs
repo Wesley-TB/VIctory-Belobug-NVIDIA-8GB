@@ -1785,11 +1785,15 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     if let Some(limit) = limit {
         return filled < limit;
     }
-    // `VICTORY_TEXTURE_STRICT_BUDGET=1` (8 GB cards, `-LowVram`): no floor
-    // admitted before the budget is checked, and 1 GiB without a budget.
-    static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let strict = *STRICT.get_or_init(|| std::env::var("VICTORY_TEXTURE_STRICT_BUDGET").is_ok_and(|v| v.trim() == "1"));
-    let floor = if strict { 0 } else { texture_floor_bytes(memory.map(|[budget, ..]| budget)) };
+    // `VICTORY_TEXTURE_STRICT_BUDGET=1` (8 GB cards, issue #467): no floor
+    // admitted before the budget is checked, and 1 GiB without a budget. On
+    // by default on a small card ([`small_card`]); `=0` turns it off there.
+    static STRICT: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let budget = memory.map(|[budget, ..]| budget);
+    let strict = STRICT
+        .get_or_init(|| std::env::var("VICTORY_TEXTURE_STRICT_BUDGET").ok().map(|v| v.trim() == "1"))
+        .unwrap_or_else(|| small_card(budget));
+    let floor = if strict { 0 } else { texture_floor_bytes(budget) };
     if filled < floor {
         return true;
     }
@@ -1803,7 +1807,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
             used,
             crate::pool::texture_room(),
             crate::shadow::card_room_kept() + targets_room_kept(),
-            room_percent(),
+            room_percent(Some(budget)),
         ),
         None => filled < if strict { 1 << 30 } else { WITHOUT_BUDGET },
     }
@@ -1909,16 +1913,29 @@ pub(crate) fn room_lately() -> bool {
 /// tenth of the budget, 1,020 MB of 10,200, stays unused while thousands of
 /// textures wait (runs 170-174); the card copies of title buffers from
 /// 1 MiB up take 449 MB more of the card than before (941 against 492),
-/// and 94 gives the textures about that much back.
+/// and 94 gives the textures about that much back. On a small card
+/// ([`small_card`]) 85 unless set, as issue #467 played with on 8 GB.
 #[cfg(windows)]
-fn room_percent() -> u64 {
-    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *PERCENT.get_or_init(|| {
-        std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(90, |percent| percent.clamp(50, 97))
-    })
+fn room_percent(budget: Option<u64>) -> u64 {
+    static PERCENT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    PERCENT
+        .get_or_init(|| {
+            std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map(|percent| percent.clamp(50, 97))
+        })
+        .unwrap_or(if small_card(budget) { 85 } else { 90 })
+}
+
+/// Whether the card's budget is that of an 8 GB card or less (at most
+/// 9 GiB): the texture queue then leaves out its floor and stops at 85 % by
+/// default, the `-LowVram` settings of issue #467, so such a card needs no
+/// switch. The 7900 XTX's measurements (10 to 10.5 GB in use) do not fit in
+/// it, and past its budget the system moves the card's memory into the PC's.
+#[cfg(any(windows, test))]
+pub(crate) fn small_card(budget: Option<u64>) -> bool {
+    budget.is_some_and(|budget| budget > 0 && budget <= 9 << 30)
 }
 
 /// For the card accounting line ([`card_accounting`]): the title texture
@@ -2407,6 +2424,52 @@ pub(crate) fn census() -> [u64; 10] {
 pub(crate) static HOST_TEXTURES: [std::sync::atomic::AtomicU64; 2] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Render targets, depth-stencil targets and textures shaders write, made
+/// with high residency priority (`VICTORY_RESIDENCY_PRIORITY=0`: none, as
+/// before). Past the card's budget the system moves memory into the PC's,
+/// and with every object at the same priority it may move what the card
+/// writes and reads every frame; it then moves what has normal priority
+/// first: the blocks of textures the title fills ([`crate::pool`]), whose
+/// textures are read once a frame at most. An 8 GB card runs past its
+/// budget (10 to 10.5 GB were in use on the 7900 XTX). Only committed
+/// resources and heaps take a priority, so a placed texture is refused and
+/// passed over. The count is in [`PRIORITY_RAISED`].
+#[cfg(windows)]
+fn keep_resident_first(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource, flags: u32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D12::{
+        ID3D12Device1, ID3D12Pageable, D3D12_RESIDENCY_PRIORITY_HIGH, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+    };
+    const WRITTEN: u32 = (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0
+        | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0
+        | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0) as u32;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if flags & WRITTEN == 0 || !*ON.get_or_init(|| std::env::var("VICTORY_RESIDENCY_PRIORITY").map_or(true, |v| v.trim() != "0")) {
+        return;
+    }
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    let (Ok(device), Ok(pageable)) = (host.device.cast::<ID3D12Device1>(), texture.cast::<ID3D12Pageable>()) else {
+        return;
+    };
+    // SAFETY: one live pageable object and its priority, on the device that
+    // made it.
+    if unsafe { device.SetResidencyPriority(1, &Some(pageable), &D3D12_RESIDENCY_PRIORITY_HIGH) }.is_ok() {
+        PRIORITY_RAISED[0].fetch_add(1, Relaxed);
+    } else {
+        PRIORITY_RAISED[1].fetch_add(1, Relaxed);
+    }
+}
+
+/// Textures [`keep_resident_first`] gave high priority, and those it was
+/// refused for (placed ones).
+#[cfg(windows)]
+pub(crate) static PRIORITY_RAISED: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// The bytes the host allocates for `texture`.
 #[cfg(windows)]
 fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> u64 {
@@ -2431,6 +2494,7 @@ impl HostTexture {
         let bytes = host_bytes(&texture);
         // SAFETY: a live texture.
         let flags = unsafe { texture.GetDesc() }.Flags.0 as u32;
+        keep_resident_first(&texture, flags);
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
         HostTexture {
@@ -4714,6 +4778,22 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+    }
+
+    #[test]
+    fn small_cards_are_those_of_an_8_gb_budget_or_less() {
+        const GIB: u64 = 1 << 30;
+        // The budgets the system gave: RTX 3070 / 4060 Ti 8 GB about 7.1 to
+        // 7.6 GiB, 12 GB cards about 11 GiB, 24 GB cards about 23 GiB.
+        assert!(super::small_card(Some(7128 << 20)));
+        assert!(super::small_card(Some(7 * GIB + GIB / 2)));
+        assert!(super::small_card(Some(9 * GIB)));
+        assert!(!super::small_card(Some(9 * GIB + 1)));
+        assert!(!super::small_card(Some(11 * GIB)));
+        assert!(!super::small_card(Some(23 * GIB)));
+        // No budget known (WARP, older runtimes): left as before.
+        assert!(!super::small_card(None));
+        assert!(!super::small_card(Some(0)));
     }
 
     /// A placed texture viewed from a later level has a host copy of that

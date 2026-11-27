@@ -852,6 +852,12 @@ fn log_memory() {
         mb(kept[4]),
         mb(kept[5]),
     );
+    let raised = [0, 1].map(|i| crate::resource::PRIORITY_RAISED[i].load(Relaxed));
+    tracing::info!(
+        "residency: {} written textures kept resident first (high priority), {} refused (placed)",
+        raised[0],
+        raised[1],
+    );
     tracing::info!(
         "memory of textures: {} title textures have no host copy yet ({:.0} MB of title memory); \
          host copies the host renders to or writes: {} alive {:.0} MB; host copies the title \
