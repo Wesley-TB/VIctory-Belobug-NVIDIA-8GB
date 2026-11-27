@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
@@ -102,6 +102,18 @@ fn prepare_folder(
     Ok(std::fs::canonicalize(folder)?)
 }
 
+/// Publishes a complete blob before its keys go into the disk index.
+/// Returns whether this call wrote bytes.
+fn publish_blob(folder: &Path, blob: u128, bytes: &[u8]) -> anyhow::Result<bool> {
+    let path = folder.join(format!("{blob:032x}.lv"));
+    if path.is_file() {
+        return Ok(false);
+    }
+    victory_core::ensure_outside_repo(&path)?;
+    victory_pipeline::publish_bytes(&path, bytes)?;
+    Ok(true)
+}
+
 fn store() -> Option<&'static Store> {
     static STORE: OnceLock<Option<Store>> = OnceLock::new();
     STORE
@@ -145,19 +157,17 @@ fn store() -> Option<&'static Store> {
                         let Some((blob, bytes, keys)) = kept(store, job) else {
                             continue;
                         };
-                        let path = to.join(format!("{blob:032x}.lv"));
-                        if !path.exists() {
-                            let part = to.join(format!("{blob:032x}.part"));
-                            if let Err(error) = victory_core::ensure_outside_repo(&part)
-                                .and_then(|()| victory_core::ensure_outside_repo(&path))
-                            {
-                                tracing::warn!(%error, "texture store refused a blob destination");
+                        match publish_blob(&to, blob, &bytes) {
+                            Ok(true) => {
+                                STATS[5].fetch_add(bytes.len() as u64, Relaxed);
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                if error.is::<victory_core::PolicyError>() {
+                                    tracing::warn!(%error, "texture store refused a blob destination");
+                                }
                                 continue;
                             }
-                            if std::fs::write(&part, &bytes[..]).is_err() || std::fs::rename(&part, &path).is_err() {
-                                continue;
-                            }
-                            STATS[5].fetch_add(bytes.len() as u64, Relaxed);
                         }
                         let text: String = keys.iter().map(|(k, e)| line_of(k, e) + "\n").collect();
                         let _ = index.write_all(text.as_bytes());
@@ -338,6 +348,23 @@ mod tests {
         let cache = clone.path().join("cache");
         assert!(prepare_folder(OsStr::new("1"), || Ok(cache.clone())).is_err());
         assert!(!cache.exists());
+    }
+
+    #[test]
+    fn publishing_a_blob_leaves_another_writers_staging_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = 1u128;
+        let part = dir.path().join(format!("{blob:032x}.part"));
+        let path = dir.path().join(format!("{blob:032x}.lv"));
+        let bytes = vec![0x4c; 512 * 1024];
+        std::fs::write(&part, b"another writer").unwrap();
+
+        assert!(publish_blob(dir.path(), blob, &bytes).unwrap());
+        assert_eq!(std::fs::read(&part).unwrap(), b"another writer");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(!publish_blob(dir.path(), blob, b"later duplicate").unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 
     #[test]
