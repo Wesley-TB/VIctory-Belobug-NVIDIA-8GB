@@ -154,7 +154,7 @@ fn run_batches(
                         }
                         let outcome = start(rest)
                             .context("could not start warm worker")
-                            .and_then(|process| child(process, &each));
+                            .and_then(|process| child(process, rest.len(), &each));
                         match outcome {
                             Ok(Some((made, why))) => {
                                 let remaining = &rest[made.min(rest.len())..];
@@ -198,7 +198,12 @@ fn start_worker(these: &[usize]) -> Result<Child> {
 }
 
 /// On abnormal exit, return the number of reports before the failure and the exit reason.
-fn child(mut process: Child, mut each: impl FnMut(usize, f64, bool)) -> Result<Option<(usize, String)>> {
+/// A successful exit must account for the whole batch.
+fn child(
+    mut process: Child,
+    expected: usize,
+    mut each: impl FnMut(usize, f64, bool),
+) -> Result<Option<(usize, String)>> {
     let Some(out) = process.stdout.take() else {
         let _ = process.kill();
         process.wait().context("warm worker stdout unavailable, failed to reap worker")?;
@@ -235,6 +240,10 @@ fn child(mut process: Child, mut each: impl FnMut(usize, f64, bool)) -> Result<O
     let status = lock(&process).wait();
     let well = status.as_ref().is_ok_and(|s| s.success());
     if well {
+        anyhow::ensure!(
+            made == expected,
+            "warm worker exited successfully but reported {made} of {expected} pipelines"
+        );
         return Ok(None);
     }
     let why = if hung.load(Ordering::Relaxed) {
@@ -341,6 +350,21 @@ mod tests {
         assert_eq!(bad.len(), 1);
         assert_eq!(bad[0].0, 8);
         assert!(!bad[0].1.is_empty());
+    }
+
+    #[test]
+    fn successful_worker_without_all_reports_fails_the_batch() {
+        let done = Mutex::new(Vec::new());
+        let error = run_batches(
+            &[7, 8],
+            1,
+            |_| fake_child("echo made 7 3.5 1&exit /b 0", Stdio::piped()),
+            |n, _, _| lock(&done).push(n),
+            |_, _| panic!("a missing report must not blacklist a pipeline"),
+        )
+        .unwrap_err();
+        assert_eq!(*lock(&done), [7]);
+        assert!(format!("{error:#}").contains("reported 1 of 2 pipelines"));
     }
 
     #[test]
