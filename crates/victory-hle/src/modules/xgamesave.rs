@@ -220,7 +220,9 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     for entry in std::fs::read_dir(dir)?.flatten() {
         let file = entry.file_name();
         let file = file.to_string_lossy();
-        if file.ends_with(".new") {
+        if file.strip_suffix(".new").and_then(version_number).is_some()
+            && entry.file_type().is_ok_and(|kind| kind.is_dir())
+        {
             std::fs::remove_dir_all(entry.path())?;
         } else if let Some(n) = version_number(&file) {
             highest = highest.max(n);
@@ -1446,6 +1448,24 @@ mod tests {
         for stray in ["v01", "v001", "v+1", "v0", "v02"] {
             assert!(slot.join(stray).exists(), "{stray} was removed");
         }
+    }
+
+    #[test]
+    fn only_staging_directories_are_removed_during_save_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+        let slot = container_dir(root, "Slot");
+        for name in ["v2.new", "v02.new", "backup.new"] {
+            std::fs::create_dir(slot.join(name)).unwrap();
+        }
+        std::fs::write(slot.join("note.new"), b"keep me").unwrap();
+
+        assert_eq!(state(root), old_state());
+        assert!(!slot.join("v2.new").exists());
+        assert!(slot.join("v02.new").is_dir());
+        assert!(slot.join("backup.new").is_dir());
+        assert_eq!(std::fs::read(slot.join("note.new")).unwrap(), b"keep me");
     }
 
     /// A newer version folder that does not read (an empty folder, a file,
