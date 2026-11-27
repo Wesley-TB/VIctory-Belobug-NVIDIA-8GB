@@ -6975,7 +6975,9 @@ impl HostList {
             let key = std::sync::Arc::as_ptr(copy) as usize;
             // A texture cut from a block may lie where another did: what the card
             // holds of that one is done with before the first upload into this one.
-            if crate::pool::on() && *first_upload {
+            // (Only such a one: an allocation of its own is refused the barrier,
+            // and the whole list does not close.)
+            if crate::pool::pooled(&copy.texture) && *first_upload {
                 aliasing.push(D3D12_RESOURCE_BARRIER {
                     Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
                     Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -7926,6 +7928,16 @@ fn split_line(frames: f64) {
         h[2],
         aside::WAITED.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames,
     );
+    if crate::watch::clean_stamp() {
+        let st = crate::shadow::stamp_counts().map(|n| n as f64 / frames);
+        tracing::info!(
+            "refreshes answered by their copy's stamp per frame (VICTORY_CLEAN_STAMP=1): {:.0} said clean by the stamp, {:.0} fell \
+             through to the exact look, {:.0} of those stamped by it",
+            st[0],
+            st[1],
+            st[2],
+        );
+    }
 }
 
 /// Whether a submission's refreshes of host copies run on several threads,
@@ -8584,6 +8596,15 @@ impl Batch {
             spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
+        } else if crate::watch::clean_stamp() {
+            // (`VICTORY_CLEAN_STAMP=1`: those their copy's stamp answers,
+            // here, before any thread is woken; the rest on the threads.)
+            let _known = crate::timeline::span("refreshes in front: those stamped clean");
+            #[cfg(feature = "diagnostics")]
+            let all = spans.len();
+            spans.retain(|(shadow, from, to)| !shadow.stamped_clean(*from, *to - *from));
+            #[cfg(feature = "diagnostics")]
+            FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
         let ahead = spans.len() > 1;
         if ahead {
@@ -8742,6 +8763,16 @@ impl Batch {
             #[cfg(feature = "diagnostics")]
             let all = self.refreshes.len();
             self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
+        } else if light && crate::watch::clean_stamp() {
+            // (`VICTORY_CLEAN_STAMP=1`: those their copy's stamp answers,
+            // here, before any thread is woken; the rest on the threads.)
+            let started = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            let all = self.refreshes.len();
+            self.refreshes.retain(|(shadow, from, to)| !shadow.stamped_clean(*from, *to - *from));
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);

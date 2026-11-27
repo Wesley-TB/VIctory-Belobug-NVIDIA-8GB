@@ -69,6 +69,10 @@ impl Shard {
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
         let before = self.written.get(&page).copied().unwrap_or(0);
         self.written.insert(page, before.max(now));
+        // Every note of the journal comes here: the copies' stamps see it.
+        if clean_stamp() {
+            STAMPS.raise(page, now);
+        }
         if parts == WHOLE || !parts_on() {
             if now >= before {
                 self.parts.remove(&page);
@@ -1383,6 +1387,198 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
     };
     (ranged != 0 || taken.iter().all(|&at| at != 0))
         && j.notes.each(first, last, |page, write| write <= taken[page - first].max(ranged))
+}
+
+/// Whether a host copy's refreshes that copy nothing are told so by a stamp
+/// of the copy's (`VICTORY_CLEAN_STAMP=1`; off by default; read once).
+///
+/// [`nothing_new`] walks the notes and the copy's pages of the whole range:
+/// some 9,000 refreshes a frame that copy nothing, 8 GB of ranges looked at
+/// page by page (run c0). A copy keeps the range the exact look last found
+/// nothing new in and the newest asking that had noted anything there then
+/// ([`STAMPS`], by 2 MiB); while no asking has noted anything newer there,
+/// and the submission's asking holds the range, the answer is the same.
+///
+/// Off with renderer port #7, even if only asked for by an A/B switch: notes
+/// are then made shared, and one with a lower number may still be under way
+/// when another's is in the table.
+pub(crate) fn clean_stamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_CLEAN_STAMP").is_some_and(|v| v == "1")
+            && std::env::var("VICTORY_AB").map_or(true, |v| !v.contains("VICTORY_PORT_JOURNAL"))
+    })
+}
+
+/// Per 2 MiB of title memory, the newest asking that noted a write of any of
+/// its pages ([`Shard::note`]), with [`clean_stamp`]; 0 for none. In pieces
+/// made when first needed and never let go, as [`Landed`].
+struct Stamps([std::sync::atomic::AtomicPtr<StampPiece>; Stamps::PIECES]);
+
+/// Of 8 GiB.
+type StampPiece = [std::sync::atomic::AtomicU64; Stamps::UNITS];
+
+impl Stamps {
+    /// Pages ([`PAGE`]) of a unit: 2 MiB.
+    const SHIFT: u32 = 5;
+    const UNITS: usize = 1 << 12;
+    /// 128 TiB, what a process has.
+    const PIECES: usize = (1usize << 47) / (PAGE << Stamps::SHIFT) / Stamps::UNITS;
+
+    const fn new() -> Stamps {
+        Stamps([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; Stamps::PIECES])
+    }
+
+    /// Page `page` was noted written by asking `now`.
+    fn raise(&self, page: usize, now: u64) {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+        let unit = page >> Stamps::SHIFT;
+        let Some(place) = self.0.get(unit / Stamps::UNITS) else {
+            return;
+        };
+        let mut piece = place.load(Acquire);
+        if piece.is_null() {
+            let made: Box<StampPiece> = Box::new([const { std::sync::atomic::AtomicU64::new(0) }; Stamps::UNITS]);
+            let made = Box::into_raw(made);
+            piece = match place.compare_exchange(std::ptr::null_mut(), made, AcqRel, Acquire) {
+                Ok(_) => made,
+                Err(there) => {
+                    // SAFETY: made just now, and another thread's is there.
+                    drop(unsafe { Box::from_raw(made) });
+                    there
+                }
+            };
+        }
+        // SAFETY: a piece, which is never freed.
+        unsafe { &(&*piece)[unit % Stamps::UNITS] }.fetch_max(now, Release);
+    }
+
+    /// The newest asking noted in the units of pages `[first, last)`. A
+    /// page outside what a process has counts as noted by every asking.
+    fn newest(&self, first: usize, last: usize) -> u64 {
+        if first >= last {
+            return 0;
+        }
+        let mut newest = 0;
+        for unit in first >> Stamps::SHIFT..=(last - 1) >> Stamps::SHIFT {
+            let Some(place) = self.0.get(unit / Stamps::UNITS) else {
+                return u64::MAX;
+            };
+            // SAFETY: null, or a piece, which is never freed.
+            if let Some(piece) = unsafe { place.load(std::sync::atomic::Ordering::Acquire).as_ref() } {
+                newest = newest.max(piece[unit % Stamps::UNITS].load(std::sync::atomic::Ordering::Acquire));
+            }
+        }
+        newest
+    }
+}
+
+static STAMPS: Stamps = Stamps::new();
+
+/// Whether a copy's stamp (`clean`: the range the exact look found nothing
+/// new in and the asking it was as of, [`nothing_new_noted`]) says that
+/// nothing of `[start, end)` was written that the copy does not hold: the
+/// range lies in the stamp's, the submission's asking holds it (as in
+/// [`nothing_new`]: else what the kernel has not told yet is not in the
+/// journal), and no asking after the stamp's noted anything in its 2 MiB.
+/// `false` whenever anything is uncertain: the exact look then answers.
+pub(crate) fn stamp_says_clean(start: usize, end: usize, clean: Option<(usize, usize, u64)>) -> bool {
+    let Some(clean) = clean else {
+        return false;
+    };
+    if !clean_stamp() || port_journal() || !stamp_covers(clean, start, end) {
+        return false;
+    }
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    // Read holding the journal shared: without renderer port #7 every note is
+    // made holding it alone, so none is half made now, and every one made
+    // before is in the table.
+    let j = journal();
+    j.ahead.holds(first, last) && STAMPS.newest(first, last) <= clean.2
+}
+
+/// Whether the stamp `clean` holds `[start, end)`.
+fn stamp_covers(clean: (usize, usize, u64), start: usize, end: usize) -> bool {
+    start < end && clean.0 <= start && end <= clean.1
+}
+
+/// [`nothing_new`], and where it says nothing is new, the stamp it makes
+/// (the newest asking noted in the range's 2 MiB, read under the same hold
+/// of the journal as the notes; `None` with renderer port #7).
+pub(crate) fn nothing_new_noted(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> (bool, Option<u64>) {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let known = published(start, end);
+    #[cfg(feature = "diagnostics")]
+    if known {
+        crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
+    }
+    let j = journal();
+    if !known && !j.ahead.holds(first, last) {
+        return (false, None);
+    }
+    let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
+        return (false, None);
+    };
+    let same = (ranged != 0 || taken.iter().all(|&at| at != 0))
+        && j.notes.each(first, last, |page, write| write <= taken[page - first].max(ranged));
+    let newest = (same && !port_journal()).then(|| STAMPS.newest(first, last));
+    (same, newest)
+}
+
+/// A copy's stamp `was` and a new one `now`: the new one, joined with the
+/// old where they meet and are as of the same asking (each holds every
+/// write noted up to it, so both together do).
+pub(crate) fn stamp_joined(was: Option<(usize, usize, u64)>, now: (usize, usize, u64)) -> (usize, usize, u64) {
+    match was {
+        Some(was) if was.2 == now.2 && was.0 <= now.1 && now.0 <= was.1 => (was.0.min(now.0), was.1.max(now.1), now.2),
+        _ => now,
+    }
+}
+
+#[cfg(test)]
+mod stamp_tests {
+    use super::{PAGE, Stamps, stamp_covers, stamp_joined};
+
+    /// What is raised is the newest of its 2 MiB, and only of them; ranges
+    /// across units and pieces see the newest of all they touch.
+    #[test]
+    fn the_table_holds_the_newest_asking_of_each_unit() {
+        let table = Box::new(Stamps::new());
+        let unit = 1usize << Stamps::SHIFT;
+        let piece = unit * Stamps::UNITS;
+        assert_eq!(table.newest(0, 10 * piece), 0);
+        table.raise(3 * unit + 1, 7);
+        table.raise(3 * unit + 5, 4);
+        assert_eq!(table.newest(3 * unit, 3 * unit + 1), 7, "the unit, not the page");
+        assert_eq!(table.newest(2 * unit, 3 * unit), 0);
+        assert_eq!(table.newest(4 * unit, 9 * unit), 0);
+        assert_eq!(table.newest(0, 4 * unit), 7);
+        table.raise(piece + 2, 9);
+        assert_eq!(table.newest(3 * unit, piece + 1), 9, "across pieces");
+        assert_eq!(table.newest(4 * unit, piece), 0);
+        table.raise(3 * unit, 2);
+        assert_eq!(table.newest(3 * unit, 3 * unit + 1), 7, "never lowered");
+        assert_eq!(table.newest(5, 5), 0);
+        // Beyond what a process has: never clean.
+        let beyond = (1usize << 47) / PAGE;
+        assert_eq!(table.newest(beyond, beyond + 1), u64::MAX);
+    }
+
+    /// A stamp holds what lies in it; stamps join only as of one asking and
+    /// where they meet.
+    #[test]
+    fn stamps_hold_their_range_and_join_as_of_one_asking() {
+        assert!(stamp_covers((100, 200, 5), 100, 200));
+        assert!(stamp_covers((100, 200, 5), 150, 160));
+        assert!(!stamp_covers((100, 200, 5), 99, 160));
+        assert!(!stamp_covers((100, 200, 5), 150, 201));
+        assert!(!stamp_covers((100, 200, 5), 150, 150));
+        assert_eq!(stamp_joined(None, (1, 2, 3)), (1, 2, 3));
+        assert_eq!(stamp_joined(Some((100, 200, 5)), (150, 300, 5)), (100, 300, 5));
+        assert_eq!(stamp_joined(Some((100, 200, 5)), (200, 300, 5)), (100, 300, 5));
+        assert_eq!(stamp_joined(Some((100, 200, 5)), (150, 300, 6)), (150, 300, 6));
+        assert_eq!(stamp_joined(Some((100, 200, 5)), (201, 300, 5)), (201, 300, 5));
+    }
 }
 
 impl Tracked {
