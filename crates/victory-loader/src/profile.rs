@@ -51,6 +51,15 @@ struct Thread {
     samples: u64,
 }
 
+impl Drop for Thread {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            // SAFETY: owned by this record since OpenThread in choose.
+            unsafe { CloseHandle(self.handle) };
+        }
+    }
+}
+
 fn cpu(thread: HANDLE) -> u64 {
     // SAFETY: zeroed is a valid FILETIME, and the calls write them.
     let mut t: [FILETIME; 4] = unsafe { std::mem::zeroed() };
@@ -233,10 +242,6 @@ fn write(
     let mut names: HashMap<u64, String> = HashMap::new();
     for (id, t) in threads {
         writeln!(out, "thread {id} {} {} {} {}", t.start, (t.now - t.first) / 10_000, t.samples, t.name)?;
-        if !t.handle.is_null() {
-            // SAFETY: opened by `choose`.
-            unsafe { CloseHandle(t.handle) };
-        }
     }
     for ((id, phase, frames), n) in counts {
         write!(out, "stack {id} {phase} {n} ")?;
@@ -307,6 +312,41 @@ mod tests {
         let (all, unread) = schedule("0,60,5,a.txt;");
         assert_eq!(all.len(), 1);
         assert!(unread.is_empty());
+    }
+
+    #[test]
+    fn sampled_handles_close_even_if_report_creation_fails() {
+        use windows_sys::Win32::Foundation::GetHandleInformation;
+        use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+
+        // SAFETY: opens a handle to this test's live thread.
+        let handle = unsafe { OpenThread(THREAD_QUERY_INFORMATION, 0, GetCurrentThreadId()) };
+        assert!(!handle.is_null());
+        let mut info = 0;
+        // SAFETY: info is a valid output pointer.
+        assert_ne!(unsafe { GetHandleInformation(handle, &mut info) }, 0);
+        let threads = HashMap::from([(
+            1,
+            Thread {
+                handle,
+                start: String::new(),
+                name: String::new(),
+                first: 0,
+                last: 0,
+                now: 0,
+                samples: 0,
+            },
+        )]);
+        let dir = tempfile::tempdir().unwrap();
+        assert!(write(dir.path().to_str().unwrap(), &threads, &HashMap::new(), &HashMap::new(), 0).is_err());
+        drop(threads);
+        // SAFETY: Windows reports an invalid handle as failure.
+        let leaked = unsafe { GetHandleInformation(handle, &mut info) } != 0;
+        if leaked {
+            // SAFETY: the regression left our handle open.
+            unsafe { CloseHandle(handle) };
+        }
+        assert!(!leaked, "the report failure leaked the sampled thread handle");
     }
 
     fn temp_file(name: &str) -> String {
