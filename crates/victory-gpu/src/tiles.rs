@@ -84,17 +84,9 @@ pub(crate) fn wanted() -> bool {
         let Some(host) = host() else {
             return false;
         };
-        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
-        // SAFETY: a plain query into a struct of its own size.
-        let asked = unsafe {
-            host.device.CheckFeatureSupport(
-                D3D12_FEATURE_D3D12_OPTIONS,
-                (&raw mut options).cast(),
-                size_of_val(&options) as u32,
-            )
-        };
-        let tier = options.TiledResourcesTier.0;
-        let on = asked.is_ok() && tier >= 2;
+        // (0 where the runtime did not answer.)
+        let tier = crate::host::profile::read(&host.device).tiled_tier;
+        let on = tier >= 2;
         tracing::info!(
             tier,
             on,

@@ -15,6 +15,26 @@ pub(crate) fn on(name: &str) -> bool {
     value_is_on(std::env::var_os(name).as_deref())
 }
 
+/// A switch whose default the host GPU decides (`crate::host::profile`).
+/// When its variable is set, `read` of the value decides, so each switch
+/// keeps its own reading (`=1` turns it on, or anything but `0` does).
+/// Unset, it is `nvidia` on an NVIDIA host and `default` on every other: an
+/// AMD host, or one whose vendor is not known, keeps the default it had.
+/// Makes the host device if it is not made yet; read it once per switch
+/// (in its `OnceLock`), never while the device is being made.
+#[cfg(windows)]
+#[expect(dead_code, reason = "the NVIDIA defaults (fallback heaps, residency waits, card buffers) are next")]
+pub(crate) fn by_host(name: &str, read: impl FnOnce(&OsStr) -> bool, default: bool, nvidia: bool) -> bool {
+    let set = std::env::var_os(name).map(|v| read(&v));
+    pick(set, crate::host::nvidia_host(), default, nvidia)
+}
+
+/// [`by_host`]'s choice: what the variable says, else the host's default.
+#[cfg_attr(not(test), expect(dead_code, reason = "used by `by_host`, whose callers are next"))]
+fn pick(set: Option<bool>, nvidia_host: bool, default: bool, nvidia: bool) -> bool {
+    set.unwrap_or(if nvidia_host { nvidia } else { default })
+}
+
 /// A switch that is on unless its variable is `0`, read once; with
 /// `VICTORY_AB` naming it (diagnostics builds, `crate::ab`), on and off while
 /// the title runs.
@@ -44,8 +64,30 @@ macro_rules! toggled {
 
 #[cfg(test)]
 mod tests {
-    use super::value_is_on;
+    use super::{pick, value_is_on};
     use std::ffi::OsStr;
+
+    #[test]
+    fn a_host_default_keeps_the_old_default_off_nvidia() {
+        // Not NVIDIA (AMD, or not known): the default as it was, either way.
+        for default in [false, true] {
+            assert_eq!(pick(None, false, default, !default), default);
+        }
+    }
+
+    #[test]
+    fn a_host_default_is_the_nvidia_one_on_nvidia() {
+        assert!(pick(None, true, false, true));
+        assert!(!pick(None, true, true, false));
+    }
+
+    #[test]
+    fn a_set_variable_wins_on_every_host() {
+        for nvidia_host in [false, true] {
+            assert!(pick(Some(true), nvidia_host, false, false));
+            assert!(!pick(Some(false), nvidia_host, true, true));
+        }
+    }
 
     #[test]
     fn unset_is_off() {

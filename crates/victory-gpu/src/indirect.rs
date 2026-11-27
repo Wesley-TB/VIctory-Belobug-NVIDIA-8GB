@@ -281,15 +281,13 @@ fn widest(amd: bool) -> u32 {
     if amd && on { 1 << 20 } else { 65_535 }
 }
 
-/// Whether `device` is an AMD card's.
+/// Whether `device` is an AMD card's. The host device's answer is its
+/// profile's; another device (a test's, a benchmark's) is asked itself.
 pub(crate) fn amd(device: &ID3D12Device) -> bool {
-    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4};
-    // SAFETY: plain queries.
-    unsafe {
-        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
-            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
-            .and_then(|a| a.GetDesc1())
-            .is_ok_and(|d| d.VendorId == 0x1002)
+    use crate::host::profile::{Vendor, vendor_of};
+    match crate::host::profile::of_host_device(device) {
+        Some(p) => p.amd(),
+        None => vendor_of(device) == Some(Vendor::Amd),
     }
 }
 

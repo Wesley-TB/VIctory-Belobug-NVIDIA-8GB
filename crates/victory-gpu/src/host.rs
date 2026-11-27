@@ -1019,6 +1019,8 @@ fn create() -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        // What the card is, once, before anything chooses a path by it.
+        let profile = profile::read(&device);
         // Before anything is made with it (`VICTORY_RECORD`).
         #[cfg(feature = "diagnostics")]
         crate::replay::record::from_env(&device);
@@ -1043,16 +1045,11 @@ fn create() -> windows::core::Result<Host> {
         }
         // the widest wave the GPU runs: 32 (NVIDIA) gets console wave64 compute programs whose
         // cross-lane code stays in 32-lane halves translated for waves of 32
-        let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
-        if device
-            .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, (&raw mut o1).cast(), size_of_val(&o1) as u32)
-            .is_ok()
-        {
-            tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
-            victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
+        if let Some((min, max)) = profile.wave_lanes {
+            tracing::info!(min, max, "host wave lanes");
+            victory_shader::emit::set_host_max_wave(max);
             // (RDNA has waves of 32 and 64, the vendor's older cards of 64 alone.)
-            let amd = crate::indirect::amd(&device);
-            victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
+            victory_shader::emit::set_host_rdna(profile.rdna());
         }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
@@ -3897,6 +3894,8 @@ mod card_steps;
 pub(crate) mod indirects;
 mod panel;
 mod place;
+pub(crate) mod profile;
+pub(crate) use profile::nvidia_host;
 pub(crate) mod rec;
 mod send;
 mod upq;
@@ -10209,18 +10208,7 @@ impl Host {
     pub(crate) fn mapped_card_memory(&self) -> bool {
         static THERE: OnceLock<bool> = OnceLock::new();
         *THERE.get_or_init(|| {
-            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
-            // SAFETY: writes `options` of the given size.
-            let ok = unsafe {
-                self.device
-                    .CheckFeatureSupport(
-                        D3D12_FEATURE_D3D12_OPTIONS16,
-                        (&raw mut options).cast(),
-                        size_of_val(&options) as u32,
-                    )
-                    .is_ok()
-            };
-            let supported = ok && options.GPUUploadHeapSupported.as_bool();
+            let supported = profile::read(&self.device).gpu_upload_heap;
             tracing::info!(supported, "card memory the CPU maps");
             supported
         })
