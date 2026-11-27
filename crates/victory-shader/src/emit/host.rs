@@ -380,6 +380,12 @@ impl Host {
         &self,
         cs: &HostShader,
     ) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+        #[cfg(test)]
+        eprintln!(
+            "{:?}: creating compute root signature ({} DXIL bytes)",
+            std::thread::current().name(),
+            cs.dxil.len()
+        );
         let root = self.root_signature_for(&[(cs, D3D12_SHADER_VISIBILITY_ALL)])?;
         let pso = self.compute_pipeline_with(&root, &cs.dxil)?;
         Ok((root, pso))
@@ -399,8 +405,22 @@ impl Host {
             },
             ..Default::default()
         };
+        // A native driver fault can terminate the test before an HRESULT returns.
+        #[cfg(test)]
+        eprintln!(
+            "{:?}: entering CreateComputePipelineState ({} DXIL bytes)",
+            std::thread::current().name(),
+            cs.len()
+        );
         // SAFETY: the description points at live data.
-        unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(|e| self.explained(e))
+        let result = unsafe { self.device.CreateComputePipelineState(&desc) };
+        #[cfg(test)]
+        eprintln!(
+            "{:?}: CreateComputePipelineState returned (success={})",
+            std::thread::current().name(),
+            result.is_ok()
+        );
+        result.map_err(|e| self.explained(e))
     }
 
     /// The error with the debug layer's messages since the last call, if
