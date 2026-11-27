@@ -176,7 +176,9 @@ fn profile((from, to, every, file): (Duration, Duration, Duration, String), star
             }
         }
         rounds += 1;
-        std::thread::sleep(every.saturating_sub(round.elapsed()));
+        let until_next_sample = every.saturating_sub(round.elapsed());
+        let until_deadline = to.saturating_sub(start.elapsed());
+        std::thread::sleep(until_next_sample.min(until_deadline));
     }
     choose(&mut threads, &mut chosen);
     if let Err(e) = write(&file, &threads, &counts, &phases, rounds) {
@@ -356,6 +358,26 @@ mod tests {
         let text = std::fs::read_to_string(&file).expect("the earlier file is still there");
         let _ = std::fs::remove_file(&file);
         assert_eq!(text, "rounds 99\nfrom an earlier run\n");
+    }
+
+    #[test]
+    fn a_long_sampling_interval_does_not_delay_the_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("profile.txt");
+        let began = Instant::now();
+        profile(
+            (
+                Duration::ZERO,
+                Duration::from_millis(250),
+                Duration::from_secs(2),
+                file.to_str().unwrap().to_owned(),
+            ),
+            began,
+            || 0,
+        );
+        assert!(began.elapsed() < Duration::from_millis(1500));
+        let report = std::fs::read_to_string(file).unwrap();
+        assert!(!report.starts_with("rounds 0"));
     }
 
     /// A window that begins late still samples until its (absolute)
