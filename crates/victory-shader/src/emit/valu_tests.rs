@@ -2730,6 +2730,7 @@ fn a_format_load_read_as_halves_loads_the_integer() {
         ran += 1;
     }
     assert!(ran > 0, "no SM 6.6 device available");
+}
 
 #[test]
 fn lds_out_of_bounds_reads_zero_and_drops_writes() {

@@ -1804,103 +1804,6 @@ fn both_host_waves_observe_the_lds_flag_after_the_join() {
     eprintln!("all 14 flag dispatches passed on a 32-lane hardware adapter");
 }
 
-/// `ds_bpermute_b32` in a console wave of 64 reads within the lane's own 32-lane half: GFX10
-/// permutes the two halves on their own (LLVM's `supportsWaveWideBPermute`, Mesa ACO's
-/// `emit_bpermute`). Lane t names lane t ^ 33, in the other half, and reads lane t ^ 1. Run on
-/// 64-lane and 32-lane host waves alike; before, the first read t ^ 33 and the second refused.
-#[test]
-fn a_backward_permute_reads_within_the_lanes_half() {
-    let body = [
-        0x3A08_00A1, // v_xor_b32 v4, 33, v0
-        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
-        0xDACC_0000,
-        0x0200_0004, // ds_bpermute_b32 v2, v4, v0
-        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
-        0xE070_1000,
-        0x8002_0201, // buffer_store_dword v2, v1, s[8:11], 0 offen
-    ];
-    let mut ran = Vec::new();
-    for threads in [64, 128] {
-        let native = native_of(&body, true, threads);
-        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-        for host_wave in [64, 32] {
-            let shader = lowered_on(&native, &p, &HashSet::new(), host_wave)
-                .unwrap_or_else(|e| panic!("{threads} threads, host waves of {host_wave}: {e:?}"));
-            if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-                v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
-            }
-            let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(out) = whole_uav(&shader, [0, 0], threads) {
-                let want: Vec<u32> = (0..threads).map(|t| t ^ 1).collect();
-                assert_eq!(out, want, "{threads} threads, host waves of {host_wave}");
-                ran.push((threads, host_wave));
-            }
-        }
-    }
-    eprintln!("ran on the hardware device (threads, host wave): {ran:?}");
-
-/// Console lanes in a 2-D or 3-D group of more than one host wave (#216). Each thread computes
-/// its flat id f from v0..v2, reads lane 0's (`v_readlane`, so the program gets console lanes)
-/// and adds that + 1 to dword f. As on the console, every dword gets exactly one add, of 1 + its
-/// wave's first id. A GPU may fill such a group in 2 x 2 quads, where rounding a host wave's
-/// first flat id down to the wave size gave two waves the same ids; 10 x 10, 12 x 12 and 24 x 8
-/// end in a partial wave. Console waves of 32 and 64 on host waves of their size, and console
-/// waves of 64 on host waves of 32.
-#[test]
-fn console_threads_of_multidimensional_groups_are_one_each() {
-    let mut ran = Vec::new();
-    for (wave64, host_wave) in [(false, 32), (true, 64), (true, 32)] {
-        let w: u32 = if wave64 { 64 } else { 32 };
-        for threads in [[w, 2, 1], [32, 2, 2], [10, 10, 1], [12, 12, 1], [24, 8, 1]] {
-            let [x, y, _] = threads;
-            let n: u32 = threads.iter().product();
-            let body = [
-                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-                0xD569_0005,
-                0x0001_FF01,
-                x, // v_mul_lo_u32 v5, v1, X
-                0xD569_0006,
-                0x0001_FF02,
-                x * y,       // v_mul_lo_u32 v6, v2, XY
-                0x4A08_0B00, // v_add_nc_u32 v4, v0, v5
-                0x4A08_0D04, // v_add_nc_u32 v4, v4, v6
-                0xD760_000C,
-                0x0001_0104, // v_readlane_b32 s12, v4, 0
-                0x7E04_020C, // v_mov_b32 v2, s12
-                0x4A04_0481, // v_add_nc_u32 v2, 1, v2
-                0x3406_0882, // v_lshlrev_b32 v3, 2, v4
-                0xE0C8_1000,
-                0x8002_0203, // buffer_atomic_add v2, v3, s[8:11], 0 offen
-            ];
-            let mut native = native_of(&body, wave64, 1);
-            // (thread ids x, y and z in v0..v2)
-            native.io = StageIo::Cs(ComputeIo {
-                rsrc2: 5 << 1 | 2 << 11,
-                threads,
-            });
-            let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-            let what = format!("console wave{w}, host waves of {host_wave}, {threads:?}");
-            let shader = lowered_on(&native, &p, &HashSet::new(), host_wave)
-                .unwrap_or_else(|e| panic!("{what}: {e:?}"));
-            if let Ok(mut v) =
-                validator::Validator::load(validator::Validator::default_path().as_deref())
-            {
-                v.validate(&mut shader.dxil.clone())
-                    .expect("DXIL validation failed");
-            }
-            let _one = super::valu_tests::ONE_AT_A_TIME
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(out) = whole_uav(&shader, [0, 0], n) {
-                let want: Vec<u32> = (0..n).map(|t| 1 + (t & !(w - 1))).collect();
-                assert_eq!(out, want, "{what}");
-                ran.push(what);
-            }
-        }
-    }
-    eprintln!("ran on the hardware device: {ran:#?}");
-
 /// The two halves of a console mask keep their bit positions after a divergent branch.
 #[test]
 fn a_branch_mask_preserves_both_words_on_the_host() {
@@ -1963,4 +1866,103 @@ fn a_branch_mask_preserves_both_words_on_the_host() {
         }
     }
     eprintln!("{:?}: wave{wave}; four thresholds, both words correct in all 64 lanes", host.adapter_name());
+}
+
+/// Console lanes in a 2-D or 3-D group of more than one host wave (#216). Each thread computes
+/// its flat id f from v0..v2, reads lane 0's (`v_readlane`, so the program gets console lanes)
+/// and adds that + 1 to dword f. As on the console, every dword gets exactly one add, of 1 + its
+/// wave's first id. A GPU may fill such a group in 2 x 2 quads, where rounding a host wave's
+/// first flat id down to the wave size gave two waves the same ids; 10 x 10, 12 x 12 and 24 x 8
+/// end in a partial wave. Console waves of 32 and 64 on host waves of their size, and console
+/// waves of 64 on host waves of 32.
+#[test]
+fn console_threads_of_multidimensional_groups_are_one_each() {
+    let mut ran = Vec::new();
+    for (wave64, host_wave) in [(false, 32), (true, 64), (true, 32)] {
+        let w: u32 = if wave64 { 64 } else { 32 };
+        for threads in [[w, 2, 1], [32, 2, 2], [10, 10, 1], [12, 12, 1], [24, 8, 1]] {
+            let [x, y, _] = threads;
+            let n: u32 = threads.iter().product();
+            let body = [
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0xD569_0005,
+                0x0001_FF01,
+                x, // v_mul_lo_u32 v5, v1, X
+                0xD569_0006,
+                0x0001_FF02,
+                x * y,       // v_mul_lo_u32 v6, v2, XY
+                0x4A08_0B00, // v_add_nc_u32 v4, v0, v5
+                0x4A08_0D04, // v_add_nc_u32 v4, v4, v6
+                0xD760_000C,
+                0x0001_0104, // v_readlane_b32 s12, v4, 0
+                0x7E04_020C, // v_mov_b32 v2, s12
+                0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+                0x3406_0882, // v_lshlrev_b32 v3, 2, v4
+                0xE0C8_1000,
+                0x8002_0203, // buffer_atomic_add v2, v3, s[8:11], 0 offen
+            ];
+            let mut native = native_of(&body, wave64, 1);
+            // (thread ids x, y and z in v0..v2)
+            native.io = StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1 | 2 << 11,
+                threads,
+            });
+            let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+            let what = format!("console wave{w}, host waves of {host_wave}, {threads:?}");
+            let shader = lowered_on(&native, &p, &HashSet::new(), host_wave)
+                .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            if let Ok(mut v) =
+                validator::Validator::load(validator::Validator::default_path().as_deref())
+            {
+                v.validate(&mut shader.dxil.clone())
+                    .expect("DXIL validation failed");
+            }
+            let _one = super::valu_tests::ONE_AT_A_TIME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(out) = whole_uav(&shader, [0, 0], n) {
+                let want: Vec<u32> = (0..n).map(|t| 1 + (t & !(w - 1))).collect();
+                assert_eq!(out, want, "{what}");
+                ran.push(what);
+            }
+        }
+    }
+    eprintln!("ran on the hardware device: {ran:#?}");
+}
+
+/// `ds_bpermute_b32` in a console wave of 64 reads within the lane's own 32-lane half: GFX10
+/// permutes the two halves on their own (LLVM's `supportsWaveWideBPermute`, Mesa ACO's
+/// `emit_bpermute`). Lane t names lane t ^ 33, in the other half, and reads lane t ^ 1. Run on
+/// 64-lane and 32-lane host waves alike; before, the first read t ^ 33 and the second refused.
+#[test]
+fn a_backward_permute_reads_within_the_lanes_half() {
+    let body = [
+        0x3A08_00A1, // v_xor_b32 v4, 33, v0
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0xDACC_0000,
+        0x0200_0004, // ds_bpermute_b32 v2, v4, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xE070_1000,
+        0x8002_0201, // buffer_store_dword v2, v1, s[8:11], 0 offen
+    ];
+    let mut ran = Vec::new();
+    for threads in [64, 128] {
+        let native = native_of(&body, true, threads);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        for host_wave in [64, 32] {
+            let shader = lowered_on(&native, &p, &HashSet::new(), host_wave)
+                .unwrap_or_else(|e| panic!("{threads} threads, host waves of {host_wave}: {e:?}"));
+            if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+                v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+            }
+            let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(out) = whole_uav(&shader, [0, 0], threads) {
+                let want: Vec<u32> = (0..threads).map(|t| t ^ 1).collect();
+                assert_eq!(out, want, "{threads} threads, host waves of {host_wave}");
+                ran.push((threads, host_wave));
+            }
+        }
+    }
+    eprintln!("ran on the hardware device (threads, host wave): {ran:?}");
 }
