@@ -2,7 +2,7 @@
 
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use walkdir::WalkDir;
@@ -63,10 +63,33 @@ impl FileScan {
             self.detail(format_args!("skipping large file {} ({size} bytes)", path.display()));
             return None;
         }
-        match fs::read(path) {
-            Ok(data) => {
+        // The file can grow after the metadata check. Read at most the limit
+        // into memory, then probe one extra byte without growing the buffer.
+        let read = fs::File::open(path).and_then(|mut file| {
+            let mut data = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+            file.by_ref().take(self.limit).read_to_end(&mut data)?;
+            if data.len() as u64 == self.limit {
+                match file.read_exact(&mut [0]) {
+                    Ok(()) => return Ok(None),
+                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(Some(data))
+        });
+        match read {
+            Ok(Some(data)) => {
                 self.files_read += 1;
                 Some(data)
+            }
+            Ok(None) => {
+                self.over_limit += 1;
+                self.detail(format_args!(
+                    "skipping {}: file exceeded {} bytes during the read",
+                    path.display(),
+                    self.limit
+                ));
+                None
             }
             Err(error) => {
                 self.read_errors += 1;
@@ -192,6 +215,20 @@ mod tests {
             "file scan incomplete (I/O errors): files read 0, skipped 1 (walk errors 0, \
              metadata errors 0, read errors 1, over 4 bytes: 0)"
         );
+    }
+
+    #[test]
+    fn file_growing_past_limit_is_still_skipped() {
+        let root = tempdir().unwrap();
+        let file = root.path().join("growing.bin");
+        fs::write(&file, b"abcd").unwrap();
+        let metadata = fs::metadata(&file).unwrap();
+        fs::write(&file, b"abcde").unwrap();
+
+        let mut scan = FileScan::new(4, false);
+        assert!(scan.read_file(&file, Ok(metadata)).is_none());
+        assert_eq!(scan.over_limit, 1);
+        assert_eq!(scan.files_read, 0);
     }
 
     #[test]
