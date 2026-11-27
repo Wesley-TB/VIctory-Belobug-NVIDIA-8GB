@@ -258,6 +258,17 @@ const ALLOC_32BIT: u64 = 1 << 33;
 /// pointer handed out.
 const HEADER: usize = 2 * size_of::<usize>();
 
+/// In a block's header, with its alignment: the block is a reservation of its
+/// own ([`XMemAllocDefault`]), not the host heap's.
+const RESERVED: usize = 1 << 63;
+/// Blocks from this size on are.
+const WATCHED_FROM: usize = 1 << 20;
+
+fn watched_default() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_XMEM_WATCHED").is_none_or(|v| v != "0"))
+}
+
 fn layout(size: usize, attributes: u64) -> Option<Layout> {
     // An alignment of at least 16 leaves room for the header.
     let align = 1usize << (attributes >> ALIGNMENT_SHIFT & 0x1f).max(4);
@@ -340,6 +351,38 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     // console's; nothing seen builds ray-tracing structures in this memory
     // (the title uses its GPU heap). Sub-allocate from a
     // reservation below 2^40 if one does.
+    // A big block is a reservation of its own, write-watched as the title's
+    // own pools are: the GPU side then copies the pages written since its last
+    // copy, where memory of the host heap is copied whole every time (a buffer
+    // of 21 MB the title fills each frame: 40 MB a frame of the 93 copied).
+    // `VICTORY_XMEM_WATCHED=0`: from the host heap, as before.
+    if watched_default() && layout.size() >= WATCHED_FROM && layout.align() <= PAGE {
+        let bytes = layout.size().next_multiple_of(PAGE);
+        // SAFETY: a fresh reservation.
+        let block = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                bytes,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        }
+        .cast::<u8>();
+        if !block.is_null() {
+            // As `XMemVirtualAlloc` tells it of its memory.
+            victory_gpu::title_memory_allocated(block as usize, bytes);
+            // SAFETY: as below; the reservation starts on a multiple of 64 KiB,
+            // so of the alignment too.
+            unsafe {
+                let user = block.add(layout.align());
+                user.sub(HEADER).cast::<[usize; 2]>().write([layout.size(), layout.align() | RESERVED]);
+                return user.cast();
+            }
+        }
+    }
     // SAFETY: the layout has a non-zero size.
     let block = unsafe { alloc(layout) };
     if block.is_null() {
@@ -371,6 +414,15 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        if align & RESERVED != 0 {
+            let block = user.sub(align & !RESERVED);
+            // What the GPU side noted of it goes first, as with the title's
+            // own `VirtualFree`: the address may be other memory's the moment
+            // it is free.
+            victory_gpu::title_memory_freed(block as usize, size.next_multiple_of(PAGE));
+            VirtualFree(block.cast(), 0, MEM_RELEASE);
+            return;
+        }
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),

@@ -137,6 +137,10 @@ pub(crate) struct HostHeap {
     /// ours keeps 2^18 there: 2^16 and 2^17 both ran out in this title.)
     dynamic: u32,
     sampler: bool,
+    /// Which heap this is, for the runs of dynamic slots lists hold
+    /// ([`SlotChunks`]): a heap made where a dropped one was has its
+    /// address, and must not be cut from that one's runs.
+    id: u64,
     /// Where the raw twins of the title's slots start
     /// (`victory_shader::emit::raw_views`; 0: there are none), and which of
     /// them are not null.
@@ -1212,6 +1216,34 @@ impl TextureQueue {
         }
     }
 
+    /// Of the slots `indices`, the ones that wait for their upload, due or
+    /// not and held or not, each with its write number as
+    /// [`TextureQueue::due`] hands it out: for a pass that has to bring
+    /// those very slots up to date now (`crate::draw::State::bake_sources`).
+    /// Not the ones uploaded whole that wait for another look.
+    fn queued(&self, indices: &[u32]) -> Vec<(u32, u64)> {
+        indices
+            .iter()
+            .filter_map(|&index| self.slots.get(&index).filter(|w| w.checked.2 == 0).map(|w| (index, w.write)))
+            .collect()
+    }
+
+    /// Puts the slots `indices` into the queue as written in `frame` and
+    /// due at once, unless they wait in it for their upload already: for
+    /// texture views a shader is about to pick by index whose host slot
+    /// shows nothing and which nothing would bring up to date (a view the
+    /// spans took for stale when the title wrote a newer one of memory it
+    /// clashes with, [`Spans::note`], and which the title reads all the
+    /// same). One uploaded whole that waits for another look is put back
+    /// too: that look would find its memory unchanged and leave it.
+    fn requeue(&mut self, indices: &[u32], frame: u64) {
+        for &index in indices {
+            if self.slots.get(&index).is_none_or(|w| w.checked.2 != 0) {
+                self.written(index, frame, frame, false);
+            }
+        }
+    }
+
     /// What [`TextureQueue::recheck`] noted of slot `index`, if it is
     /// waiting for such a look.
     fn checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
@@ -1738,6 +1770,10 @@ impl HostHeap {
             count,
             dynamic: extra,
             sampler,
+            id: {
+                static IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
             raw,
             twins: (0..if raw == 0 { 0 } else { count + extra }).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
             #[cfg(feature = "diagnostics")]
@@ -1856,6 +1892,84 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// Whether a list's tables of dynamic slots are cut from runs it takes at
+/// once ([`HostHeap::dynamic_in`]): `VICTORY_SLOT_CHUNKS=1`. Unset or 0:
+/// every table searches the heap under its lock, as before (for measuring
+/// one against the other).
+fn slot_chunks_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_SLOT_CHUNKS").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// A list's first run of dynamic slots ([`SlotChunks`]); each further one
+/// is twice the last, up to [`CHUNK_MOST`].
+const CHUNK_FIRST: u32 = 16;
+
+/// The longest run a list takes; a longer table is searched for alone.
+const CHUNK_MOST: u32 = 1024;
+
+/// No run of free dynamic slots for a table of `n` (logged once).
+fn dynamic_refused(n: u32) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+}
+
+/// The runs of dynamic slots one list cuts its tables from
+/// ([`HostHeap::dynamic_in`]): per host heap, the one it took last. Held by
+/// the list's `crate::draw::State` with the runs themselves, and cleared
+/// when they are given back.
+#[derive(Default)]
+pub(crate) struct SlotChunks {
+    open: Vec<OpenChunk>,
+}
+
+/// A run of a host heap's (by its `id`) dynamic slots, by heap index:
+/// the next slot not cut yet, its end, and its length.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OpenChunk {
+    heap: u64,
+    next: u32,
+    end: u32,
+    size: u32,
+}
+
+impl SlotChunks {
+    /// Forgets every run (they were given back).
+    pub(crate) fn clear(&mut self) {
+        self.open.clear();
+    }
+
+    /// `n` slots cut from the run held of heap `heap`, if they fit: the
+    /// first's index.
+    fn carve(&mut self, heap: u64, n: u32) -> Option<u32> {
+        let chunk = self.open.iter_mut().find(|c| c.heap == heap)?;
+        if chunk.end - chunk.next < n {
+            return None;
+        }
+        let first = chunk.next;
+        chunk.next += n;
+        Some(first)
+    }
+
+    /// How long the next run of heap `heap` is, for a table of `n` (at
+    /// most [`CHUNK_MOST`]).
+    fn next_size(&self, heap: u64, n: u32) -> u32 {
+        let last = self.open.iter().find(|c| c.heap == heap).map_or(0, |c| c.size);
+        last.saturating_mul(2).clamp(CHUNK_FIRST, CHUNK_MOST).max(n)
+    }
+
+    /// The run of `size` slots from `first` of heap `heap` was taken, and its
+    /// first `n` went to a table. What was left of the one before stays
+    /// held (and unused) until the list gives its slots back.
+    fn opened(&mut self, heap: u64, first: u32, size: u32, n: u32) {
+        let chunk = OpenChunk { heap, next: first + n, end: first + size, size };
+        match self.open.iter_mut().find(|c| c.heap == heap) {
+            Some(open) => *open = chunk,
+            None => self.open.push(chunk),
+        }
+    }
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
@@ -1867,6 +1981,79 @@ impl HostHeap {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
+        let found = self.search(n);
+        if found.is_none() {
+            dynamic_refused(n);
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            if found.is_none() {
+                add(C::DynamicRefused, 1);
+            }
+            add(C::DynamicNs, started.elapsed().as_nanos() as u64);
+        }
+        found
+    }
+
+    /// [`HostHeap::dynamic`] for a table of the list whose runs are
+    /// `chunks` (`VICTORY_SLOT_CHUNKS=1`; else just that): the table's
+    /// first slot, and a run of slots now taken for the list, which it
+    /// gives back with [`HostHeap::release`] as it gives back its tables
+    /// (none: the table was cut from a run the list holds already).
+    ///
+    /// Every table searched the slots one by one from a cursor, under the
+    /// one lock all 8 recording threads share: 11,416 tables a frame, 6.8 ms
+    /// of searching. Here a list takes a run of slots under the lock (16,
+    /// doubling with each further run up to [`CHUNK_MOST`], so a list of a
+    /// few tables holds few it does not use) and cuts its tables from it
+    /// without one. That is sound only because a list's slots all go back
+    /// at once: `crate::draw::State` gives back everything it holds when
+    /// its submission has run (`tables_done`), is reset or dropped, and
+    /// clears `chunks` with it, so no table is cut from a run given back.
+    pub(crate) fn dynamic_in(&self, chunks: &mut SlotChunks, n: u32) -> Option<(u32, Option<(u32, u32)>)> {
+        if !slot_chunks_on() || self.sampler || n == 0 || n > CHUNK_MOST || n > self.dynamic {
+            return self.dynamic(n).map(|first| (first, Some((first, n))));
+        }
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
+        let found = chunks.carve(self.id, n).map(|first| (first, None)).or_else(|| {
+            // With a quarter of the slots or fewer free, a run's unused
+            // part could refuse another list's table: tables take what
+            // they need, as before.
+            let size = chunks.next_size(self.id, n);
+            let roomy = self.free.load(std::sync::atomic::Ordering::Relaxed) >= self.dynamic / 4;
+            if roomy
+                && size <= self.dynamic
+                && let Some(first) = self.search(size)
+            {
+                chunks.opened(self.id, first, size, n);
+                return Some((first, Some((first, size))));
+            }
+            self.search(n).map(|first| (first, Some((first, n))))
+        });
+        if found.is_none() {
+            dynamic_refused(n);
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            if found.is_none() {
+                add(C::DynamicRefused, 1);
+            }
+            add(C::DynamicNs, started.elapsed().as_nanos() as u64);
+        }
+        found
+    }
+
+    /// `n` consecutive free dynamic slots, taken: the first's index (no
+    /// statistics; [`HostHeap::dynamic`]).
+    fn search(&self, n: u32) -> Option<u32> {
+        if n == 0 || n > self.dynamic {
+            return None;
+        }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
@@ -1897,18 +2084,8 @@ impl HostHeap {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
             }
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
-            #[cfg(feature = "diagnostics")]
-            {
-                use crate::copystat::{C, add};
-                add(C::DynamicRefused, 1);
-                add(C::DynamicNs, started.elapsed().as_nanos() as u64);
-            }
             return None;
         };
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % end) as u32;
@@ -1950,6 +2127,16 @@ impl HostHeap {
         let writes = self.textures.lock().unwrap_or_else(|e| e.into_inner()).writes;
         let noted = |ranges: &Mutex<Vec<(u64, u64)>>| !ranges.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
         (writes, noted(&REMAPPED) || noted(&PAGE_WRITTEN))
+    }
+
+    /// See [`TextureQueue::requeue`].
+    pub(crate) fn texture_slots_requeue(&self, indices: &[u32], frame: u64) {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).requeue(indices, frame);
+    }
+
+    /// See [`TextureQueue::queued`].
+    pub(crate) fn texture_slots_queued(&self, indices: &[u32]) -> Vec<(u32, u64)> {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).queued(indices)
     }
 
     /// Every title slot of the queue that is due at `frame`, and whether
@@ -3586,6 +3773,76 @@ fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     }
 }
 
+/// The unsigned integer format with the layout of a 16-bit float or
+/// signed integer format (one, two or four channels), if `format` is one.
+pub(crate) fn half_format(format: u32) -> Option<u32> {
+    match format {
+        // R16G16B16A16_FLOAT and _SINT: R16G16B16A16_UINT.
+        10 | 14 => Some(12),
+        // R16G16_FLOAT and _SINT: R16G16_UINT.
+        34 | 38 => Some(36),
+        // R16_FLOAT and _SINT: R16_UINT.
+        54 | 59 => Some(57),
+        _ => None,
+    }
+}
+
+/// `view` as a shader is shown it where it moves a buffer's 16-bit
+/// channels as unsigned integers
+/// (`victory_shader::emit::HostShader::half_views`): a buffer view in a
+/// 16-bit float or signed format, in the unsigned format of the same
+/// layout, through which every 16-bit pattern is read and stored as it
+/// is. `None` for every other view: the title's own serves (an unsigned
+/// one already carries the bits; a texture can only be viewed in the
+/// formats it was made for).
+pub(crate) fn half_view(view: &View) -> Option<View> {
+    // Buffer views: dimension 1 in the title's description of either kind.
+    const BUFFER: u32 = 1;
+    match view {
+        View::Shader(resource, Some(desc)) if desc[1] == BUFFER => {
+            let mut desc = *desc;
+            desc[0] = half_format(desc[0])?;
+            Some(View::Shader(*resource, Some(desc)))
+        }
+        View::Unordered(resource, counter, Some(desc)) if desc[1] == BUFFER => {
+            let mut desc = *desc;
+            desc[0] = half_format(desc[0])?;
+            Some(View::Unordered(*resource, *counter, Some(desc)))
+        }
+        View::Placed(unordered, resource, desc) if resource[0] == BUFFER && desc[1] == BUFFER => {
+            let mut desc = *desc;
+            desc[0] = half_format(desc[0])?;
+            Some(View::Placed(*unordered, *resource, desc))
+        }
+        _ => None,
+    }
+}
+
+/// The format of `view`, a buffer view through which a shader moves
+/// 16-bit channels as unsigned integers
+/// (`victory_shader::emit::HostShader::half_views`), if those integers
+/// are not what the console gives: a format of wider channels, a
+/// normalised one or a signed 8-bit one, whose values the console converts
+/// to and from halves. `None` for the formats the integers serve exactly
+/// (16 bits a channel of any kind, through [`half_view`] where needed, and
+/// unsigned channels of fewer bits; the title's are 16-bit unsigned) and
+/// for any other view.
+pub(crate) fn half_inexact(view: &View) -> Option<u32> {
+    // Buffer views: dimension 1 in the title's description of either kind.
+    const BUFFER: u32 = 1;
+    // R16G16B16A16, R16G16 and R16 (float, unsigned, signed), then
+    // R10G10B10A2, R8G8B8A8, R8G8 and R8 unsigned.
+    const EXACT: [u32; 13] = [10, 12, 14, 34, 36, 38, 54, 57, 59, 25, 30, 50, 62];
+    let format = match view {
+        View::Shader(_, Some(desc)) | View::Unordered(_, _, Some(desc)) if desc[1] == BUFFER => {
+            desc[0]
+        }
+        View::Placed(_, resource, desc) if resource[0] == BUFFER && desc[1] == BUFFER => desc[0],
+        _ => return None,
+    };
+    (!EXACT.contains(&format)).then_some(format)
+}
+
 fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     let mut words = *words;
     words[0] = crate::resource::pc_format(words[0]);
@@ -5196,6 +5453,243 @@ mod tests {
         super::read_all(start);
     }
 
+    /// The unsigned twin of a 16-bit float or signed format has its layout,
+    /// and only buffer views in such a format are shown as another view.
+    #[test]
+    fn only_16_bit_float_and_signed_buffer_views_get_an_unsigned_twin() {
+        for (format, unsigned) in [(10, 12), (14, 12), (34, 36), (38, 36), (54, 57), (59, 57)] {
+            assert_eq!(half_format(format), Some(unsigned));
+            assert_eq!(
+                crate::resource::element(format),
+                crate::resource::element(unsigned),
+                "format {format}"
+            );
+        }
+        // The unsigned formats themselves, normalised 16-bit formats, and
+        // wider and narrower ones.
+        for other in [0, 12, 36, 57, 11, 13, 35, 37, 56, 58, 42, 17, 30, 61] {
+            assert_eq!(half_format(other), None, "format {other}");
+        }
+        const BUFFER: u32 = 1;
+        let words = |format: u32, dimension: u32| [format, dimension, 5768, 0, 0, 0, 64, 0, 0, 0];
+        // R16G16B16A16_FLOAT: a buffer of halves a program moves as they are.
+        assert_eq!(
+            half_view(&View::Unordered(7, 0, Some(words(10, BUFFER)))),
+            Some(View::Unordered(7, 0, Some(words(12, BUFFER))))
+        );
+        assert_eq!(
+            half_view(&View::Shader(7, Some(words(54, BUFFER)))),
+            Some(View::Shader(7, Some(words(57, BUFFER))))
+        );
+        let mut placed = [0u32; 16];
+        placed[..10].copy_from_slice(&words(38, BUFFER));
+        placed[10] = 0x1234_0000;
+        let mut twin = placed;
+        twin[0] = 36;
+        let memory = [BUFFER, 0, 0, 0, 512, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0];
+        assert_eq!(
+            half_view(&View::Placed(true, memory, placed)),
+            Some(View::Placed(true, memory, twin))
+        );
+        // The title's kind (R16G16B16A16_UINT and R16_UINT buffers), a
+        // texture view (dimension 4: 2D), a view without a description, a
+        // constant buffer: the title's own.
+        assert_eq!(
+            half_view(&View::Unordered(7, 0, Some(words(12, BUFFER)))),
+            None
+        );
+        assert_eq!(half_view(&View::Shader(7, Some(words(57, BUFFER)))), None);
+        assert_eq!(half_view(&View::Unordered(7, 0, Some(words(10, 4)))), None);
+        assert_eq!(half_view(&View::Shader(7, None)), None);
+        assert_eq!(half_view(&View::Constant(0x1000, 256)), None);
+    }
+
+    /// The buffer views through which the integers a shader moves halves
+    /// as are not what the console gives are named; the title's are not.
+    #[test]
+    fn views_whose_values_the_console_would_convert_are_named() {
+        const BUFFER: u32 = 1;
+        let words = |format: u32, dimension: u32| [format, dimension, 5768, 0, 0, 0, 64, 0, 0, 0];
+        for exact in [10, 12, 14, 34, 36, 38, 54, 57, 59, 25, 30, 50, 62] {
+            let view = View::Unordered(7, 0, Some(words(exact, BUFFER)));
+            assert_eq!(half_inexact(&view), None, "format {exact}");
+        }
+        // R32_FLOAT, R32_UINT, R16G16B16A16_UNORM, R8G8B8A8_UNORM, R8_SINT,
+        // and a structured or raw view (no format).
+        for inexact in [41, 42, 11, 28, 64, 0] {
+            let view = View::Shader(7, Some(words(inexact, BUFFER)));
+            assert_eq!(half_inexact(&view), Some(inexact));
+        }
+        let mut placed = [0u32; 16];
+        placed[..10].copy_from_slice(&words(41, BUFFER));
+        let memory = [BUFFER, 0, 0, 0, 512, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0];
+        assert_eq!(half_inexact(&View::Placed(true, memory, placed)), Some(41));
+        // Not a buffer view.
+        assert_eq!(half_inexact(&View::Shader(7, Some(words(41, 4)))), None);
+        assert_eq!(half_inexact(&View::Constant(0x1000, 256)), None);
+    }
+
+    /// The two ways a translated `buffer_load_format_d16_xyzw` and
+    /// `buffer_store_format_d16_xyzw` have moved a typed buffer's 16-bit
+    /// channels, on the host device, over a buffer that holds every 16-bit
+    /// pattern. As unsigned integers through an unsigned view (the title's
+    /// own R16G16B16A16_UINT, or the twin `half_view` gives a float one)
+    /// every pattern comes back as it was. By way of floats, as before
+    /// (load as floats, each to its half's bits; each half widened and
+    /// stored as a float): through the title's integer view that is
+    /// outside what D3D12 defines, and what the device gives is printed,
+    /// not checked (1 pattern of 65,536 on the cards tried: the network
+    /// that moves the title's faces computed zeros).
+    #[test]
+    fn halves_cross_an_unsigned_buffer_view_unchanged() {
+        const MOVES: &str = r#"
+#define RS "DescriptorTable(UAV(u0, numDescriptors=2))"
+#ifdef BY_FLOATS
+RWBuffer<float4> from : register(u0);
+RWBuffer<float4> to : register(u1);
+#else
+RWBuffer<uint4> from : register(u0);
+RWBuffer<uint4> to : register(u1);
+#endif
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
+#ifdef BY_FLOATS
+    uint4 h = f32tof16(from[id.x]);
+#else
+    uint4 h = from[id.x] & 0xffff;
+#endif
+    uint low = h.x | h.y << 16;
+    uint high = h.z | h.w << 16;
+#ifdef BY_FLOATS
+    to[id.x] = float4(f16tof32(low), f16tof32(low >> 16), f16tof32(high), f16tof32(high >> 16));
+#else
+    to[id.x] = uint4(low & 0xffff, low >> 16, high & 0xffff, high >> 16);
+#endif
+}
+"#;
+        const ELEMENTS: usize = 1 << 14;
+        const BYTES: u64 = ELEMENTS as u64 * 8;
+        const TITLES: u32 = 12; // R16G16B16A16_UINT
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let heap: ID3D12DescriptorHeap = {
+            let desc = D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 2,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            };
+            // SAFETY: plain heap creation.
+            unsafe { host.device.CreateDescriptorHeap(&desc) }.expect("a view heap")
+        };
+        // How many of the 65,536 patterns come back as they were, moved by
+        // the program `by_floats` or not, through views in `format`.
+        let moved = |by_floats: bool, format: u32| -> usize {
+            let source = if by_floats {
+                MOVES
+                    .replace("BY_FLOATS_OR_NOT", "main")
+                    .replace("#ifdef BY_FLOATS", "#if 1")
+            } else {
+                MOVES
+                    .replace("BY_FLOATS_OR_NOT", "main")
+                    .replace("#ifdef BY_FLOATS", "#if 0")
+            };
+            let code = crate::host::compile(
+                &source,
+                windows::core::s!("main"),
+                windows::core::s!("cs_5_1"),
+            )
+            .expect("the test's shader");
+            let (from, filled) = host.shared_buffer(BYTES).expect("a buffer");
+            let (to, result) = host.shared_buffer(BYTES).expect("a buffer");
+            // SAFETY: the shader's own root signature and plain creation
+            // calls; both mappings hold `BYTES` bytes; the views are of
+            // live buffers, in slots of the heap made above; an open list.
+            unsafe {
+                let root: ID3D12RootSignature = host
+                    .device
+                    .CreateRootSignature(0, &code)
+                    .expect("a root signature");
+                let pso: ID3D12PipelineState = host
+                    .device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: code.as_ptr().cast(),
+                            BytecodeLength: code.len(),
+                        },
+                        ..Default::default()
+                    })
+                    .expect("a pipeline");
+                let filled = std::slice::from_raw_parts_mut(filled.cast::<u16>(), ELEMENTS * 4);
+                for (pattern, half) in filled.iter_mut().enumerate() {
+                    *half = pattern as u16;
+                }
+                std::ptr::write_bytes(result, 0xee, BYTES as usize);
+                let view = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT(format as i32),
+                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_UAV {
+                            NumElements: ELEMENTS as u32,
+                            ..Default::default()
+                        },
+                    },
+                };
+                let start = heap.GetCPUDescriptorHandleForHeapStart();
+                let step = host
+                    .device
+                    .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                    as usize;
+                host.device.CreateUnorderedAccessView(
+                    &from,
+                    None::<&ID3D12Resource>,
+                    Some(&view),
+                    start,
+                );
+                let second = D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: start.ptr + step,
+                };
+                host.device.CreateUnorderedAccessView(
+                    &to,
+                    None::<&ID3D12Resource>,
+                    Some(&view),
+                    second,
+                );
+                let list = host.new_list().expect("a host list");
+                list.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetPipelineState(&pso);
+                list.list
+                    .SetComputeRootDescriptorTable(0, heap.GetGPUDescriptorHandleForHeapStart());
+                list.list.Dispatch(ELEMENTS as u32 / 64, 1, 1);
+                list.close();
+                host.execute(&[&list]);
+                assert!(
+                    host.device.GetDeviceRemovedReason().is_ok(),
+                    "the device, after views in format {format}"
+                );
+                let result = std::slice::from_raw_parts(result.cast::<u16>(), ELEMENTS * 4);
+                (0..=u16::MAX)
+                    .filter(|&p| result[usize::from(p)] == p)
+                    .count()
+            }
+        };
+        // A float view of halves is shown as the title's kind of view.
+        assert_eq!(half_format(10), Some(TITLES));
+        let unsigned = moved(false, TITLES);
+        let by_floats = moved(true, TITLES);
+        eprintln!(
+            "halves through an R16G16B16A16_UINT buffer view: {unsigned} of 65536 patterns came back unchanged moved as unsigned integers, {by_floats} moved by way of floats"
+        );
+        assert_eq!(
+            unsigned, 65_536,
+            "patterns unchanged, moved as unsigned integers"
+        );
+    }
+
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
     #[test]
@@ -5715,6 +6209,35 @@ mod tests {
         assert_eq!(q.room(6), 0);
     }
 
+    /// The slots a draw names are handed out whatever their turn: not due
+    /// yet, or held back for lack of room. One uploaded whole that waits
+    /// for another look is not waiting for its upload; put back, it is
+    /// due at once as a slot written now, and so is one the queue did not
+    /// hold. A slot that waits for its upload already keeps its place.
+    #[test]
+    fn slots_a_draw_names_are_handed_out_whatever_their_turn() {
+        let mut q = TextureQueue::default();
+        q.written(5, 1, 0, false);
+        q.written(6, 1, 50, false);
+        q.written(7, 1, 0, false);
+        let due = q.due(1, 100);
+        let write = |index: u32| due.iter().find(|d| d.0 == index).map(|d| d.1).unwrap();
+        assert!(!due.iter().any(|d| d.0 == 6), "slot 6 is not due before frame 50");
+        q.hold(7, write(7), 101);
+        let named = |q: &TextureQueue| -> Vec<u32> { q.queued(&[5, 6, 7, 8]).into_iter().map(|d| d.0).collect() };
+        assert_eq!(named(&q), [5, 6, 7]);
+        assert_eq!(q.queued(&[7]), [(7, write(7))], "with the write the pass hands back");
+        q.recheck(5, write(5), 9, (0x1000, 0x100), 1234, 0, 1);
+        assert_eq!(named(&q), [6, 7]);
+        let six = q.queued(&[6]);
+        q.requeue(&[5, 6, 8], 3);
+        assert_eq!(named(&q), [5, 6, 7, 8]);
+        assert_eq!(q.checked(5), None);
+        assert_eq!(q.queued(&[6]), six, "slot 6 waited already: as it was");
+        let now: Vec<u32> = q.due(3, 100).into_iter().map(|d| d.0).collect();
+        assert!(now.contains(&5) && now.contains(&8) && !now.contains(&6) && !now.contains(&7));
+    }
+
     /// Textures of which only the smallest levels are held, packed into
     /// one another's address range (the three of run 188: 0x2c000 bytes
     /// each at full size, their starts 0x2000 and 0x4000 apart): writing
@@ -6083,6 +6606,77 @@ mod tests {
         let last = first + heap.dynamic - 1;
         heap.release(last, 1);
         assert_eq!(heap.dynamic(2), None);
+    }
+
+    #[test]
+    fn slot_chunks_cut_tables_in_turn_and_never_past_the_run() {
+        let mut chunks = SlotChunks::default();
+        // Nothing held: nothing is cut, and the first run is the shortest.
+        assert_eq!(chunks.carve(1, 1), None);
+        assert_eq!(chunks.next_size(1, 3), CHUNK_FIRST);
+        chunks.opened(1, 100, CHUNK_FIRST, 3);
+        assert_eq!(chunks.carve(1, 4), Some(103));
+        assert_eq!(chunks.carve(1, 9), Some(107));
+        // 0 left of 16: none fits, and none comes from another heap's run.
+        assert_eq!(chunks.carve(1, 1), None);
+        assert_eq!(chunks.carve(2, 1), None);
+        // Each further run is twice the last, up to the most, or the table.
+        assert_eq!(chunks.next_size(1, 1), 2 * CHUNK_FIRST);
+        assert_eq!(chunks.next_size(1, 500), 500);
+        chunks.opened(1, 200, CHUNK_MOST, 1);
+        assert_eq!(chunks.next_size(1, 1), CHUNK_MOST);
+        assert_eq!(chunks.carve(1, CHUNK_MOST - 1), Some(201));
+        assert_eq!(chunks.carve(1, 1), None);
+    }
+
+    #[test]
+    fn slot_chunks_of_two_heaps_stay_apart_and_go_when_cleared() {
+        let mut chunks = SlotChunks::default();
+        chunks.opened(1, 10, 16, 2);
+        chunks.opened(2, 10, 32, 5);
+        assert_eq!(chunks.carve(1, 2), Some(12));
+        assert_eq!(chunks.carve(2, 2), Some(15));
+        // A new run replaces the heap's last; the other heap's stays.
+        chunks.opened(1, 50, 32, 1);
+        assert_eq!(chunks.carve(1, 1), Some(51));
+        assert_eq!(chunks.carve(2, 1), Some(17));
+        // Given back: nothing more is cut from them, and runs start short.
+        chunks.clear();
+        assert_eq!(chunks.carve(1, 1), None);
+        assert_eq!(chunks.carve(2, 1), None);
+        assert_eq!(chunks.next_size(1, 1), CHUNK_FIRST);
+    }
+
+    /// Every slot a list cuts lies in one run it took, and no two tables
+    /// share one: a pseudo-random list of table lengths.
+    #[test]
+    fn slot_chunks_hand_each_slot_out_once() {
+        let mut chunks = SlotChunks::default();
+        let mut taken = vec![false; 1 << 20];
+        let mut heap_next = 0u32;
+        let mut seed = 0x2545_f491_u32;
+        for _ in 0..5_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let n = 1 + seed % 40;
+            let first = match chunks.carve(7, n) {
+                Some(first) => first,
+                None => {
+                    // The heap's search, standing in: the next free run.
+                    let size = chunks.next_size(7, n);
+                    let first = heap_next;
+                    heap_next += size;
+                    chunks.opened(7, first, size, n);
+                    first
+                }
+            };
+            for slot in first..first + n {
+                assert!(!taken[slot as usize], "slot {slot} handed out twice");
+                taken[slot as usize] = true;
+            }
+            assert!(first + n <= heap_next);
+        }
     }
 }
 

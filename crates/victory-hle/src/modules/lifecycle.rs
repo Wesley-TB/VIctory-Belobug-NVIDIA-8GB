@@ -406,10 +406,27 @@ pub fn wait_for_previous() {
     }
 }
 
+/// In a build that records a profile for profile-guided optimization
+/// (`--cfg pgo_record` with `-Cprofile-generate`), writes it out:
+/// `TerminateProcess` runs none of the exit handlers that would.
+#[allow(unexpected_cfgs)]
+fn write_profile() {
+    #[cfg(pgo_record)]
+    {
+        unsafe extern "C" {
+            fn __llvm_profile_write_file() -> i32;
+        }
+        // SAFETY: the profile runtime's own call, linked in by the flag.
+        let failed = unsafe { __llvm_profile_write_file() };
+        tracing::info!(failed, "profile for profile-guided optimization written");
+    }
+}
+
 fn end() {
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     victory_gpu::pipeline::save_pipeline_cache();
+    write_profile();
     // SAFETY: ends this process, as the console ends a suspended title.
     unsafe { TerminateProcess(GetCurrentProcess(), 0) };
 }

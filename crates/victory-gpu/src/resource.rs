@@ -142,9 +142,9 @@ pub(crate) fn element(format: u32) -> Option<(u64, u64)> {
         1..=4 => (16, 1),
         5..=8 => (12, 1),
         9..=22 => (8, 1),
-        23..=47 | 67 | 87..=93 | 116 | 117 | 189 | 191 => (4, 1),
+        23..=47 | 67 | 87..=93 | 116 | 117 | 189 => (4, 1),
         118..=120 => (3, 1),
-        48..=59 | 68 | 69 | 85 | 86 | 115 => (2, 1),
+        48..=59 | 68 | 69 | 85 | 86 | 115 | 191 => (2, 1),
         60..=65 | 190 => (1, 1),
         70..=72 | 79..=81 => (8, 4),
         73..=78 | 82..=84 | 94..=99 => (16, 4),
@@ -1794,17 +1794,55 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
-        Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
-                < budget / 100 * room_percent()
-        }
+        Some([budget, used, ..]) => room_at(
+            budget,
+            used,
+            crate::pool::texture_room(),
+            crate::shadow::card_room_kept() + targets_room_kept(),
+            room_percent(),
+        ),
         None => filled < WITHOUT_BUDGET,
     }
 }
 
+/// [`room`] for a card with a budget: what our own blocks of textures have
+/// free is room, what is kept for buffer copies and render targets is not.
+/// None from 96 % of the budget in use as the system counts it, whatever
+/// the blocks have free.
+#[cfg(any(windows, test))]
+fn room_at(budget: u64, used: u64, free_in_blocks: u64, kept: u64, percent: u64) -> bool {
+    let share = |percent: u64| budget / 100 * percent;
+    if used >= share(96) {
+        return false;
+    }
+    used.saturating_sub(free_in_blocks) + kept < share(percent)
+}
+
+/// What counts as in use of the card for the texture queue ([`room`]) and
+/// the sweep ([`let_go_idle`]): what the system says (`used`), less what our
+/// own blocks of textures have free, plus what is kept free for buffer
+/// copies and render targets not made yet. From 92 % of the budget on, what
+/// the system says alone: the free parts of blocks are the card's memory in
+/// use all the same, and they do not all get used. Run 3 on an 8 GB card:
+/// 4,352 MB of blocks held some 2,600 MB of textures, the card stood at
+/// 7,306 MB of a budget of 7,128, and by the count without the blocks' free
+/// parts it was at 83 %, so nothing was let go.
+#[cfg(windows)]
+fn card_used(budget: u64, used: u64) -> u64 {
+    card_used_of(budget, used, crate::pool::texture_room(), crate::shadow::card_room_kept() + targets_room_kept())
+}
+
+#[cfg(any(windows, test))]
+fn card_used_of(budget: u64, used: u64, free_in_blocks: u64, kept: u64) -> u64 {
+    if used >= budget / 100 * 92 {
+        return used;
+    }
+    used.saturating_sub(free_in_blocks) + kept
+}
+
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
-/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072; 0: none, as
+/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072, on Series S 1,536; 0: none, as
 /// before) less what such copies hold now.
 ///
 /// Measured (runs 193, 197, 198): 652 MB of them before the world, 2,255
@@ -1827,7 +1865,16 @@ pub(crate) fn targets_room_kept() -> u64 {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
+            .map_or_else(
+                // Series S renders smaller targets: 1,187 to 1,226 MB of them
+                // after eight minutes of its world, and with 3,072 kept the
+                // queue was refused (690 passes) at 84 % of an 8 GB card.
+                || match crate::console::current() {
+                    crate::console::Console::SeriesS => 1536 << 20,
+                    crate::console::Console::SeriesX => 3072 << 20,
+                },
+                |mb| mb.min(8192) << 20,
+            )
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
@@ -2135,10 +2182,7 @@ pub(crate) fn let_go_idle() {
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
     let (idle_ms, most) = match memory {
         Some([budget, used, ..]) if keep => {
-            let used = used.saturating_sub(crate::pool::texture_room())
-                + crate::shadow::card_room_kept()
-                + targets_room_kept();
-            crate::host::vram_keep(budget, used)
+            crate::host::vram_keep(budget, card_used(budget, used))
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
@@ -2582,8 +2626,10 @@ fn host_texture_as(
     };
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
-    // in no texel).
-    if fills(desc)
+    // in no texel). Not a reserved one (`crate::tiles`): it has no memory
+    // of its own to cut, and a piece of a block cannot be given tiles.
+    if !reserved
+        && fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
         && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
@@ -4636,6 +4682,22 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn a_card_at_its_budget_counts_its_blocks_free_parts_as_used() {
+        const MIB: u64 = 1 << 20;
+        // Below 92 %: the blocks' free parts are room, what is kept is not.
+        assert_eq!(super::card_used_of(7128 * MIB, 6000 * MIB, 1700 * MIB, 300 * MIB), 4600 * MIB);
+        // Run 3: over the budget, and counted so.
+        assert_eq!(super::card_used_of(7128 * MIB, 7306 * MIB, 1700 * MIB, 319 * MIB), 7306 * MIB);
+        assert_eq!(super::card_used_of(0, 5 * MIB, 9 * MIB, 0), 5 * MIB);
+        // Room: the blocks' holes are filled up to 96 % of the budget.
+        assert!(super::room_at(7128 * MIB, 6000 * MIB, 200 * MIB, 300 * MIB, 90));
+        assert!(!super::room_at(7128 * MIB, 6300 * MIB, 0, 300 * MIB, 90));
+        assert!(super::room_at(7128 * MIB, 6800 * MIB, 1700 * MIB, 300 * MIB, 90));
+        assert!(!super::room_at(7128 * MIB, 6800 * MIB, 200 * MIB, 0, 90));
+        assert!(!super::room_at(7128 * MIB, 6900 * MIB, 1700 * MIB, 0, 90));
     }
 
     #[test]
