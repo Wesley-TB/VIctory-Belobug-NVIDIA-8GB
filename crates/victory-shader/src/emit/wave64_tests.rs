@@ -14,6 +14,428 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 
+// Regression fixtures adapted from Belobug PR #299.
+// Preserve the original scalar-count expectations on wave32 hardware.
+
+fn pr299_scalar_probe(body: &[u32], expected: u32) {
+    scalar_loop_probe(body, true, &[expected; 64], Some(32));
+}
+
+fn scalar_loop_probe(body: &[u32], wave64: bool, expected: &[u32], wave_size: Option<u32>) {
+    let native = scalar_loop_program(body, wave64, expected.len() as u32);
+    let p = crate::spill::build(&native).expect("IR");
+    check_scalar_loop(&native, &p, expected, wave_size);
+}
+
+fn scalar_loop_program(body: &[u32], wave64: bool, threads: u32) -> NativeProgram {
+    let mut words = body.to_vec();
+    words.extend_from_slice(&[
+        0x3412_1482,
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 9,
+    ]);
+    native_of(&words, wave64, threads)
+}
+
+fn emit_scalar_loop(
+    native: &NativeProgram,
+    p: &ir::Program,
+    host_wave: u32,
+) -> Result<HostShader, ShaderError> {
+    let st = structure::structure(p).expect("structure");
+    let res = resource::track(p, &native.layout, native.stage, Some(&st)).expect("resources");
+    let io = io::raise(p, native).expect("IO");
+    let bytes = crate::dxbc::build(&[]);
+    let container = crate::Container::parse(&bytes).expect("container");
+    let previous = lower::TEST_HOST_WAVE.replace(Some(host_wave));
+    let result = super::emit_with_retries(&container, native, p, &st, &io, &res);
+    lower::TEST_HOST_WAVE.set(previous);
+    result
+}
+
+fn scalar_loop_wave_range(shader: &HostShader) -> (u32, u32) {
+    let dxil = crate::Container::parse(&shader.dxil).expect("emitted container");
+    let psv = dxil.part(crate::dxbc::FourCC::PSV0).expect("PSV0").data;
+    (
+        u32::from_le_bytes(psv[20..24].try_into().unwrap()),
+        u32::from_le_bytes(psv[24..28].try_into().unwrap()),
+    )
+}
+
+fn check_scalar_loop(
+    native: &NativeProgram,
+    p: &ir::Program,
+    expected: &[u32],
+    wave_size: Option<u32>,
+) {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+    };
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    // Exercise production selection even on CI without a physical GPU.
+    let shader = emit_scalar_loop(native, p, 32).expect("production emission for a Wave32-only host");
+    let range = wave_size.map_or((0, u32::MAX), |n| (n, n));
+    assert_eq!(scalar_loop_wave_range(&shader), range);
+    eprintln!("CPU PASS: production emission for max wave 32; PSV0 range {range:?}");
+
+    let mut validator = match validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        Ok(mut validator) => {
+            validator.validate(&mut shader.dxil.clone()).expect("DXIL validation");
+            eprintln!("CPU PASS: DXIL validation for max wave 32");
+            Some(validator)
+        }
+        Err(error) => {
+            eprintln!("CPU SKIP: DXIL validator unavailable: {error:?}");
+            None
+        }
+    };
+
+    if std::env::var("VICTORY_WARP").as_deref() == Ok("1") {
+        eprintln!("GPU SKIP: VICTORY_WARP=1 requests a software adapter");
+        return;
+    }
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(error) => {
+            eprintln!("GPU SKIP: no eligible physical SM 6.6 adapter: {error}");
+            return;
+        }
+    };
+    let name = host.adapter_name().expect("adapter name");
+    let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: the output points at a feature structure of the specified size.
+    unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut waves).cast(),
+            size_of_val(&waves) as u32,
+        )
+    }
+    .expect("query adapter wave capabilities");
+    let max_wave = waves.WaveLaneCountMax;
+    eprintln!("Adapter: {name}; max wave: {max_wave}; wave ops: {}", waves.WaveOps.as_bool());
+    if !waves.WaveOps.as_bool() {
+        eprintln!("GPU SKIP: the selected adapter does not support wave operations");
+        return;
+    }
+    if wave_size == Some(32) && max_wave != 32 {
+        eprintln!("GPU SKIP: the synchronized route requires a physical adapter with max wave 32");
+        return;
+    }
+    let shader = if max_wave == 32 {
+        shader
+    } else {
+        // These controls have no fixed host wave requirement. Use the actual
+        // adapter's target for the hardware run and retain the CPU check above.
+        let shader = emit_scalar_loop(native, p, max_wave).expect("production emission for the selected adapter");
+        assert_eq!(scalar_loop_wave_range(&shader), range);
+        if let Some(validator) = &mut validator {
+            validator.validate(&mut shader.dxil.clone()).expect("DXIL validation for the selected adapter");
+        }
+        shader
+    };
+
+    let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(expected.len() as u32)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch");
+
+    let got = &out[0][..expected.len()];
+    eprintln!("GPU readback: {got:?}");
+    assert_eq!(got, expected);
+    eprintln!("GPU PASS: {name}; all {} readback dwords matched", got.len());
+}
+
+#[test]
+fn pr299_divergent_scalar_loop() {
+    pr299_scalar_probe(&[
+        0x7E14_0300, 0x4A02_0081,
+        0xBE82_0480, 0xBE86_0380,
+        0x8106_8106, 0x4E02_0281,
+        0x7D84_0280, 0x8882_026A,
+        0x8AFE_027E, 0xBF89_FFFA,
+        0x88FE_027E, 0x7E00_0206,
+    ], 64);
+}
+
+#[test]
+fn pr299_nested_divergent_scalar_loops() {
+    pr299_scalar_probe(&[
+        0x7E14_0300, 0x3602_0083,
+        0x4A02_0281, 0x2C08_0084,
+        0x4A08_0881, 0xBE86_0380,
+        0xBE82_0480, 0xBE8C_0480,
+        0x7E06_0304, 0x8106_8106,
+        0x4E06_0681, 0x7D84_0680,
+        0x888C_0C6A, 0x8AFE_0C7E,
+        0xBF89_FFFA, 0x88FE_0C7E,
+        0x4E02_0281, 0x7D84_0280,
+        0x8882_026A, 0x8AFE_027E,
+        0xBF89_FFF2, 0x88FE_027E,
+        0x7E00_0206,
+    ], 16);
+}
+
+#[test]
+fn scalar_loop_control_uniform_exit() {
+    scalar_loop_probe(
+        &[
+            0x7E14_0300, // v_mov_b32 v10, v0
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0x8106_8106, // loop: s_add_i32 s6, s6, 1
+            0xBF0A_8406, // s_cmp_lt_u32 s6, 4
+            0xBF85_FFFD, // s_cbranch_scc1 loop
+            0x7E00_0206, // v_mov_b32 v0, s6
+        ],
+        true,
+        &[4; 64],
+        None,
+    );
+}
+
+fn vector_loop_control(shared: bool) -> Vec<u32> {
+    let mut body = vec![
+        0x7E14_0300, // v_mov_b32 v10, v0
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+        0x7E16_0280, // v_mov_b32 v11, 0
+        0xBE82_0480, // s_mov_b64 s[2:3], 0
+    ];
+    if shared {
+        body.extend([0xBE86_0387, 0x8106_8306]); // s6 = 7; loop: s6 += 3
+    }
+    body.extend([
+        0x4A16_1681, // v_add_nc_u32 v11, 1, v11
+        0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+        0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+        0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+        0x8AFE_027E, // s_andn2_b64 exec, exec, s[2:3]
+        if shared { 0xBF89_FFF9 } else { 0xBF89_FFFA },
+        0x88FE_027E,                                    // s_or_b64 exec, exec, s[2:3]
+        if shared { 0x4A00_1606 } else { 0x7E00_030B }, // v0 = v11 + s6 or v11
+    ]);
+    body
+}
+
+#[test]
+fn scalar_loop_control_divergent_vector_only() {
+    let want: Vec<_> = (1..=64).collect();
+    scalar_loop_probe(&vector_loop_control(false), true, &want, None);
+}
+
+#[test]
+fn scalar_loop_control_shared_scalar_and_lane_local_vector() {
+    let want: Vec<_> = (1..=64).map(|t| 7 + 3 * 64 + t).collect();
+    scalar_loop_probe(&vector_loop_control(true), true, &want, Some(32));
+}
+
+#[test]
+fn scalar_loop_control_native_wave32() {
+    let body = [
+        0x7E14_0300, // v_mov_b32 v10, v0
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+        0x7E16_0280, // v_mov_b32 v11, 0
+        0xBE82_0380, // s_mov_b32 s2, 0
+        0x4A16_1681, // loop: v_add_nc_u32 v11, 1, v11
+        0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+        0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1
+        0x8802_026A, // s_or_b32 s2, vcc_lo, s2
+        0x8A7E_027E, // s_andn2_b32 exec_lo, exec_lo, s2
+        0xBF89_FFFA, // s_cbranch_execnz loop
+        0x887E_027E, // s_or_b32 exec_lo, exec_lo, s2
+        0x7E00_030B, // v_mov_b32 v0, v11
+    ];
+    let want: Vec<_> = (1..=64).collect();
+    scalar_loop_probe(&body, false, &want, None);
+}
+
+#[test]
+fn scalar_loop_control_inner_scalar_read_each_outer_iteration() {
+    let body = [
+        0x7E14_0300, // v_mov_b32 v10, v0
+        0x3602_0083, // v_and_b32 v1, 3, v0
+        0x4A02_0281, // v_add_nc_u32 v1, 1, v1 (outer trip count)
+        0x2C08_0084, // v_lshrrev_b32 v4, 4, v0
+        0x4A08_0881, // v_add_nc_u32 v4, 1, v4 (inner trip count)
+        0x7E16_0280, // v_mov_b32 v11, 0
+        0xBE82_0480, // s_mov_b64 s[2:3], 0
+        0xBE8C_0480, // outer: s_mov_b64 s[12:13], 0
+        0xBE86_0380, // s_mov_b32 s6, 0
+        0x7E06_0304, // v_mov_b32 v3, v4
+        0x8106_8306, // inner: s_add_i32 s6, s6, 3
+        0x4E06_0681, // v_subrev_nc_u32 v3, 1, v3
+        0x7D84_0680, // v_cmp_eq_u32 vcc, 0, v3
+        0x888C_0C6A, // s_or_b64 s[12:13], vcc, s[12:13]
+        0x8AFE_0C7E, // s_andn2_b64 exec, exec, s[12:13]
+        0xBF89_FFFA, // s_cbranch_execnz inner
+        0x88FE_0C7E, // s_or_b64 exec, exec, s[12:13]
+        0x4A16_1606, // v_add_nc_u32 v11, s6, v11
+        0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+        0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+        0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+        0x8AFE_027E, // s_andn2_b64 exec, exec, s[2:3]
+        0xBF89_FFF0, // s_cbranch_execnz outer
+        0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+        0x7E00_030B, // v_mov_b32 v0, v11
+    ];
+    // Lane 63 keeps the inner counter running four steps in every outer
+    // iteration. Other lanes add that scalar only while their own EXEC bit is set.
+    let want: Vec<_> = (0..64).map(|t| 12 * ((t & 3) + 1)).collect();
+    scalar_loop_probe(&body, true, &want, Some(32));
+}
+
+#[test]
+fn scalar_loop_control_consecutive_loops_carry_scalars_through_a_phi() {
+    let body = [
+        0x7E14_0300, // v_mov_b32 v10, v0
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+        0xBE86_0380, // s_mov_b32 s6, 0
+        0xBE87_038B, // s_mov_b32 s7, 11
+        0xBE82_0480, // s_mov_b64 s[2:3], 0
+        0x8106_8106, // first loop: s6 += 1
+        0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+        0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+        0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+        0x8AFE_027E, // s_andn2_b64 exec, exec, s[2:3]
+        0xBF89_FFFA, // s_cbranch_execnz first loop
+        0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+        0x3602_1483, // v_and_b32 v1, 3, v10
+        0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+        0xBE82_0480, // s_mov_b64 s[2:3], 0
+        0x8106_8306, // second loop: s6 += 3, starting at the first loop's result
+        0x8107_8207, // s7 += 2
+        0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+        0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+        0x8882_026A, // s_or_b64 s[2:3], vcc, s[2:3]
+        0x8AFE_027E, // s_andn2_b64 exec, exec, s[2:3]
+        0xBF89_FFF9, // s_cbranch_execnz second loop
+        0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+        0x8106_0706, // s_add_i32 s6, s6, s7
+        0x7E00_0206, // v_mov_b32 v0, s6
+    ];
+    let native = scalar_loop_program(&body, true, 64);
+    let p = crate::spill::build(&native).expect("IR");
+    let st = structure::structure(&p).expect("structure");
+    let latches: Vec<_> = ir::reverse_postorder(&p.blocks)
+        .into_iter()
+        .filter(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execnz"))
+        .collect();
+    let &[first, second] = latches.as_slice() else {
+        panic!("expected two loop latches, got {latches:?}");
+    };
+    let reg = ir::Reg::S(6);
+    let first_result = p.blocks[first]
+        .insts
+        .iter()
+        .find_map(|i| i.write(reg))
+        .expect("first loop's s6");
+    let structure::LaneExit::Branch {
+        taken: second_header,
+        not_taken: after_second,
+        ..
+    } = st.exits[second]
+    else {
+        panic!("expected the second loop branch");
+    };
+    assert!(p.blocks[second_header]
+        .phis
+        .iter()
+        .any(|phi| phi.reg == reg && phi.args.contains(&first_result)));
+    assert!(!p.blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .any(|i| i.reads.iter().any(|&(_, value)| value == first_result)));
+    for reg in [reg, ir::Reg::S(7)] {
+        let result = p.blocks[second]
+            .insts
+            .iter()
+            .find_map(|i| i.write(reg))
+            .expect("second loop scalar write");
+        assert!(p.blocks[after_second].insts.iter().any(|i| i.read(reg) == Some(result)));
+    }
+    assert_eq!(lower::scalar_loop_latches(&p, &st), HashSet::from([first, second]));
+    eprintln!("CPU PASS: two latches selected, first scalar escapes through a phi, two scalars escape the second loop");
+    check_scalar_loop(&native, &p, &[64 + 3 * 4 + 11 + 2 * 4; 64], Some(32));
+}
+
+#[test]
+fn scalar_loop_control_excludes_multiple_console_waves() {
+    let body = vector_loop_control(true);
+    for (threads, range) in [(64, (32, 32)), (128, (0, u32::MAX))] {
+        let native = scalar_loop_program(&body, true, threads);
+        let p = crate::spill::build(&native).expect("IR");
+        let st = structure::structure(&p).expect("structure");
+        assert_eq!(lower::scalar_loop_latches(&p, &st).len(), 1);
+        let shader = emit_scalar_loop(&native, &p, 32).expect("production emission");
+        assert_eq!(scalar_loop_wave_range(&shader), range, "group size {threads}");
+    }
+    eprintln!("CPU PASS: the same loop selects Wave32 for 64 threads and stays unpinned for 128 threads");
+}
+
+#[test]
+fn scalar_loop_control_early_exit_cannot_enter_the_synchronized_path() {
+    let body = vector_loop_control(true);
+    let mut words = vec![
+        0x7D88_00A0,                           // v_cmp_gt_u32 vcc, 32, v0
+        0xBE8C_246A,                           // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0000 | (body.len() + 3) as u32, // s_cbranch_execz past body and store to s_endpgm
+    ];
+    words.extend(body);
+    let native = scalar_loop_program(&words, true, 64);
+    let p = crate::spill::build(&native).expect("IR");
+    let st = structure::structure(&p).expect("structure");
+    assert_eq!(branches_named(&p, "s_cbranch_execz"), 1);
+    assert!(lower::scalar_loop_latches(&p, &st).is_empty());
+    let shader = emit_scalar_loop(&native, &p, 32).expect("production emission without synchronized latches");
+    assert_eq!(scalar_loop_wave_range(&shader), (0, u32::MAX));
+    eprintln!("CPU PASS: bypassing control flow excludes the synchronized route");
+}
+
+#[test]
+fn scalar_loop_control_refuses_without_group_sync() {
+    // group_sync() is cached per process. Use a clean libtest process to
+    // exercise the actual setting without changing other tests' environment.
+    const PASSED: &str = "CPU PASS: VICTORY_GROUP_SYNC=0 rejected the synchronized scalar loop";
+    if super::group_sync() != 0 {
+        let name = concat!(module_path!(), "::scalar_loop_control_refuses_without_group_sync");
+        let test = name.split_once("::").unwrap().1;
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env("VICTORY_GROUP_SYNC", "0")
+            .output()
+            .expect("run the group synchronization control");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success() && stderr.contains(PASSED), "{stdout}\n{stderr}");
+        eprint!("{stderr}");
+        return;
+    }
+    let native = scalar_loop_program(&vector_loop_control(true), true, 64);
+    let p = crate::spill::build(&native).expect("IR");
+    assert!(matches!(
+        emit_scalar_loop(&native, &p, 32),
+        Err(ShaderError::Unsupported {
+            what: "a divergent loop's scalar result without group synchronization",
+            ..
+        })
+    ));
+    eprintln!("{PASSED}");
+}
+
 /// 64 threads in one console wave. Each thread t holds the bit `1 << (t >> 1)`; the threads
 /// below s0 (a root constant) OR theirs over the wave inside `if (t < s0) { ... }` and store
 /// the result to dword 0 of the raw UAV.

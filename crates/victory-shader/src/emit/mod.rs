@@ -486,6 +486,30 @@ pub fn emit(
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
+    if native.wave64
+        && lower::host_max_wave() == 32
+        && st.wide.is_empty()
+        && matches!(native.io, crate::native::StageIo::Cs(cs)
+            if cs.threads.iter().product::<u32>() == 64 && cs.lds_bytes() == 0)
+        && !crate::spill::is_spilled(native)
+        && res.waterfall.compares.is_empty()
+    {
+        let wide = lower::scalar_loop_latches(p, st);
+        if !wide.is_empty() {
+            if group_sync() == 0 {
+                return Err(ShaderError::Unsupported {
+                    offset: 0,
+                    what: "a divergent loop's scalar result without group synchronization",
+                });
+            }
+            let st = structure::structure_wide(p, &wide)?;
+            let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+            // This route needs the exact group vote. Per-lane and local-wave
+            // retries would lose the scalar state that selected it.
+            return emit_program(c, native, p, &st, io, &res).map(|(shader, _)| shader);
+        }
+    }
+
     let original = emit_program(c, native, p, st, io, res);
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
