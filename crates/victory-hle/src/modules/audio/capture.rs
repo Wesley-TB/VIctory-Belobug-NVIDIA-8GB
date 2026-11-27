@@ -13,7 +13,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Media::Audio::{
-    AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
+    AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
+    AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, AUDCLNT_SHAREMODE_SHARED,
     AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK,
     AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
     AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
@@ -115,6 +116,44 @@ fn header(frames: u64) -> [u8; 44] {
     h
 }
 
+#[derive(Default)]
+struct Timeline {
+    origin: Option<(u64, u64)>,
+    last: u64,
+}
+
+impl Timeline {
+    fn position(&mut self, written: u64, timestamp: Option<u64>) -> u64 {
+        let Some(qpc) = timestamp else {
+            return written;
+        };
+        if qpc < self.last {
+            self.origin = None;
+        }
+        self.last = qpc;
+        let (first, first_frame) = *self.origin.get_or_insert((qpc, written));
+        // Windows returns QPC positions in 100 ns units.
+        let frames = u128::from(qpc - first) * u128::from(RATE) / 10_000_000;
+        first_frame.saturating_add(frames as u64)
+    }
+}
+
+#[cfg(test)]
+mod timeline_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_audio_timestamps_do_not_move_the_timeline() {
+        let mut timeline = Timeline::default();
+        assert_eq!(timeline.position(0, None), 0);
+        assert_eq!(timeline.position(480, Some(5_000_000)), 480);
+        assert_eq!(timeline.position(960, None), 960);
+        assert_eq!(timeline.position(1440, Some(6_000_000)), 5280);
+        assert_eq!(timeline.position(5760, Some(5_500_000)), 5760);
+        assert_eq!(timeline.position(6240, Some(6_500_000)), 10560);
+    }
+}
+
 fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: COM calls with parameters built here; buffers are used only
     // between `GetBuffer` and `ReleaseBuffer`.
@@ -183,7 +222,8 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         client.Start()?;
         tracing::info!(path = %path.display(), "recording the title's audio");
 
-        let (mut written, mut first) = (0u64, None);
+        let mut written = 0u64;
+        let mut timeline = Timeline::default();
         let mut patched = Instant::now();
         loop {
             std::thread::sleep(Duration::from_millis(10));
@@ -191,8 +231,8 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             while capture.GetNextPacketSize()? > 0 {
                 let (mut data, mut frames, mut flags, mut qpc) = (std::ptr::null_mut(), 0, 0, 0);
                 capture.GetBuffer(&mut data, &mut frames, &mut flags, None, Some(&mut qpc))?;
-                // Where this packet belongs, from its time stamp (100 ns).
-                let at = (qpc - *first.get_or_insert(qpc)) * u64::from(RATE) / 10_000_000;
+                let valid = flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 == 0;
+                let at = timeline.position(written, valid.then_some(qpc));
                 if at > written + u64::from(RATE / 500) {
                     tracing::debug!(
                         ms = (at - written) * 1000 / u64::from(RATE),
