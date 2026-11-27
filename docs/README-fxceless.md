@@ -314,6 +314,22 @@ Windows SDK's `bin/<version>/x64/dxil.dll`, then falls back to the DLL search
 path when no SDK copy is found. This is a test/offline-validation dependency;
 the translated shaders do not require it at runtime.
 
+### The 32-lane host path on an AMD card
+
+NVIDIA and Intel cards run waves of at most 32 lanes, so a console wave64
+compute program is translated for them in another form (two host waves per
+console wave). The shader tests translate as for a 64-lane host unless a test
+says otherwise. An RDNA card runs waves of 32 too: run the suite a second time
+in the form those cards get.
+
+```powershell
+$env:VICTORY_TEST_HOST_WAVE = '32'
+cargo test -p victory-shader --lib --locked -- --test-threads=1
+```
+
+A test that sets its own host width keeps it. A card that only runs waves of
+64 (GCN) cannot run this mode.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with
