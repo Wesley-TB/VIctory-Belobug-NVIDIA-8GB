@@ -2730,4 +2730,94 @@ fn a_format_load_read_as_halves_loads_the_integer() {
         ran += 1;
     }
     assert!(ran > 0, "no SM 6.6 device available");
+
+#[test]
+fn lds_out_of_bounds_reads_zero_and_drops_writes() {
+    // 512 bytes = 128 LDS dwords (`0..512`); addresses >= 512 are out of bounds.
+    // 1. Seed LDS[0] = v2 (`0x1234_5678`), then `ds_read_b32 v0, v1`.
+    let mut read_body = vec![vop1(0x001, 5, 0x80)]; // v_mov_b32 v5, 0
+    read_body.extend(ds(DS_WRITE_B32, 0, 5, 2));
+    read_body.push(S_BARRIER);
+    read_body.extend(ds(DS_READ_B32, 0, 1, 0));
+    let read_shader = build_cs(&read_body, 64, 512);
+    run_cases(
+        &read_shader,
+        &[
+            [0, 0x1234_5678, 0, 0],
+            [512, 0x1234_5678, 0, 0],
+            [1024, 0x1234_5678, 0, 0],
+            [0xFFFF_FFFC, 0x1234_5678, 0, 0],
+        ],
+        |backend, _, inp, got| {
+            let want = if inp[0] == 0 { inp[1] } else { 0 };
+            assert_eq!(got, want, "{backend}: OOB read at {:#x}", inp[0]);
+        },
+    );
+
+    // 2. Seed LDS[0] = `0xCAFE_BABE` (v2), write v3 at address v1, read LDS[0].
+    let mut write_body = vec![vop1(0x001, 5, 0x80)];
+    write_body.extend(ds(DS_WRITE_B32, 0, 5, 2));
+    write_body.push(S_BARRIER);
+    write_body.extend(ds(DS_WRITE_B32, 0, 1, 3));
+    write_body.push(S_BARRIER);
+    write_body.extend(ds(DS_READ_B32, 0, 5, 0));
+    let write_shader = build_cs(&write_body, 64, 512);
+    run_cases(
+        &write_shader,
+        &[
+            [0, 0xCAFE_BABE, 0xDEAD_BEEF, 0],
+            [512, 0xCAFE_BABE, 0xDEAD_BEEF, 0],
+            [1024, 0xCAFE_BABE, 0xDEAD_BEEF, 0],
+            [0xFFFF_FFFC, 0xCAFE_BABE, 0xDEAD_BEEF, 0],
+        ],
+        |backend, _, inp, got| {
+            let want = if inp[0] == 0 { inp[2] } else { inp[1] };
+            assert_eq!(got, want, "{backend}: OOB write at {:#x}", inp[0]);
+        },
+    );
+
+    // 3. OOB returning atomic returns 0 without mutating LDS[0].
+    let mut rtn_body = vec![vop1(0x001, 5, 0x80)];
+    rtn_body.extend(ds(DS_WRITE_B32, 0, 5, 2));
+    rtn_body.push(S_BARRIER);
+    rtn_body.push(vop1(0x001, 0, vgpr(4))); // v0 = sentinel v4 before atomic
+    rtn_body.extend(ds(DS_MAX_RTN_F32, 0, 1, 3));
+    let rtn_shader = build_cs(&rtn_body, 64, 512);
+    run_cases(
+        &rtn_shader,
+        &[
+            // Use v3 == v2 in-bounds so all 64 lanes observe the same prior value.
+            [0, 1.5f32.to_bits(), 1.5f32.to_bits(), 0x7777_7777],
+            [512, 1.5f32.to_bits(), 9.0f32.to_bits(), 0x7777_7777],
+            [0xFFFF_FFFC, 1.5f32.to_bits(), 9.0f32.to_bits(), 0x7777_7777],
+        ],
+        |backend, _, inp, got| {
+            let want = if inp[0] == 0 { inp[1] } else { 0 };
+            assert_eq!(got, want, "{backend}: OOB ds_max_rtn_f32 at {:#x}", inp[0]);
+        },
+    );
+
+    let mut rtn_mem_body = vec![vop1(0x001, 5, 0x80)];
+    rtn_mem_body.extend(ds(DS_WRITE_B32, 0, 5, 2));
+    rtn_mem_body.push(S_BARRIER);
+    rtn_mem_body.extend(ds(DS_MAX_RTN_F32, 0, 1, 3));
+    rtn_mem_body.push(S_BARRIER);
+    rtn_mem_body.extend(ds(DS_READ_B32, 0, 5, 0));
+    let rtn_mem_shader = build_cs(&rtn_mem_body, 64, 512);
+    run_cases(
+        &rtn_mem_shader,
+        &[
+            [0, 1.5f32.to_bits(), 9.0f32.to_bits(), 0],
+            [512, 1.5f32.to_bits(), 9.0f32.to_bits(), 0],
+            [0xFFFF_FFFC, 1.5f32.to_bits(), 9.0f32.to_bits(), 0],
+        ],
+        |backend, _, inp, got| {
+            let want = if inp[0] == 0 { inp[2] } else { inp[1] };
+            assert_eq!(
+                got, want,
+                "{backend}: OOB ds_max_rtn_f32 clobbered LDS[0] at {:#x}",
+                inp[0]
+            );
+        },
+    );
 }
