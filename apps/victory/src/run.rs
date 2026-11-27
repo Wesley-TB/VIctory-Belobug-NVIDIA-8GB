@@ -58,6 +58,15 @@ pub fn run(
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
     let fsr = fsr_4k::FsrPreset::requested()?;
+    anyhow::ensure!(fsr.is_none() || matches!(console, Console::SeriesX), "FSR 4K requires Series X mode");
+    let pc_fsr = execute && std::env::var_os("VICTORY_PC_FSR").is_some_and(|value| value == "1");
+    let fidelityfx_dir = if pc_fsr || fsr.is_some() {
+        Some(cfg.fidelityfx_dir.as_deref().context(
+            "PC FidelityFX requires amd_fidelityfx_upscaler_dx12.dll. Set VICTORY_FIDELITYFX_DIR or [paths].fidelityfx_dir to its folder.",
+        )?)
+    } else {
+        None
+    };
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let mut prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -68,16 +77,16 @@ pub fn run(
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
-    let image = if let Some(preset) = fsr {
-        anyhow::ensure!(matches!(console, Console::SeriesX), "FSR 4K requires Series X mode");
+    if let Some(preset) = fsr {
         fsr_4k::prepare_fsr_4k(&mut prepared, preset)?;
-        let dir = cfg.fidelityfx_dir.as_deref().context(
-            "FSR 4K requires amd_fidelityfx_upscaler_dx12.dll. Set VICTORY_FIDELITYFX_DIR or [paths].fidelityfx_dir to its folder.",
-        )?;
+    }
+    if let Some(dir) = fidelityfx_dir {
         // Select the provider before the first lookup builds the import registry.
         victory_hle::modules::fidelityfx::use_host_dir(dir)
             .map_err(anyhow::Error::msg)
             .with_context(|| format!("loading the PC FSR upscaler from {}", dir.display()))?;
+    }
+    let image = if let Some(preset) = fsr {
         // SAFETY: Windows supports setting the environment across threads.
         // No title code has run or queried DXGI yet.
         unsafe { std::env::set_var("VICTORY_DISPLAY_MODE", "3840x2160") };

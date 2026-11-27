@@ -110,6 +110,12 @@ For PC FSR 4.1.2, set `[paths].fidelityfx_dir` in `victory.toml` or
 `amd_fidelityfx_upscaler_dx12.dll`. Use the DirectX 12 upscaler in
 `Kits/FidelityFX/signedbin`. [AMD FSR SDK 2.4.0](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.4.0/Kits/FidelityFX/signedbin)
 
+For PC FidelityFX at the title's normal resolution, including Series S at
+1080p, use `VICTORY_PC_FSR=1` without `-Fsr4K`. This selects the PC provider
+while keeping the current console profile and its resolution settings. The
+title must choose FidelityFX to use it. Set `VICTORY_UPSCALER=7` where that
+selector is supported. The title's default render scale is a starting point.
+
 `scripts\play.ps1 -Exe <path> -Fsr4K quality` selects 2560×1440 input for
 the retail 1.0.2.1 Series X 4K SDR profile. `balanced` selects 2258×1270
 and `performance` selects 1920×1080. All three output 3840×2160. With

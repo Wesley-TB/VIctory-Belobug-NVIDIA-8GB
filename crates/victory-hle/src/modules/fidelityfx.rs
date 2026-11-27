@@ -377,7 +377,7 @@ fn choose(offered: Vec<(u64, String)>) -> Result<(u64, String), String> {
         None => {
             let names: Vec<&str> = offered.iter().map(|(_, name)| name.as_str()).collect();
             Err(format!(
-                "the SDK offers this adapter neither FSR 4.1.2 nor FSR 3.1 (offered: {}); run without -Fsr4K (VICTORY_FSR_4K)",
+                "the SDK offers this adapter neither FSR 4.1.2 nor FSR 3.1 (offered: {}); run without VICTORY_PC_FSR or -Fsr4K (VICTORY_FSR_4K)",
                 if names.is_empty() { "nothing".into() } else { names.join(", ") }
             ))
         }

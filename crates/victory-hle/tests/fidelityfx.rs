@@ -278,13 +278,13 @@ fn the_titles_upscaler_runs_on_the_host() {
         );
         out
     };
-    // Exercise FidelityFX Quality at a 4K output resolution.
-    let render = match std::env::var("VICTORY_FSR_TEST_PRESET").as_deref() {
-        Ok("balanced") => [2258u32, 1270],
-        Ok("performance") => [1920, 1080],
-        _ => [2560, 1440],
+    // Exercise the 4K presets or the stock 1080p output size.
+    let (render, output) = match std::env::var("VICTORY_FSR_TEST_PRESET").as_deref() {
+        Ok("1080p") => ([1280u32, 720], [1920u32, 1080]),
+        Ok("balanced") => ([2258, 1270], [3840, 2160]),
+        Ok("performance") => ([1920, 1080], [3840, 2160]),
+        _ => ([2560, 1440], [3840, 2160]),
     };
-    let output = [3840u32, 2160];
     let at = |size: [u32; 2], format, flags| make(texture(size[0].into(), size[1], format, flags));
     let target = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     let color = at(render, DXGI_FORMAT_R16G16B16A16_FLOAT, target);
@@ -400,7 +400,12 @@ fn the_titles_upscaler_runs_on_the_host() {
         width: &mut render_width,
         height: &mut render_height,
     };
-    for (mode, expected) in [(1, [2560, 1440]), (2, [2258, 1270]), (3, [1920, 1080])] {
+    let expected_sizes = if output == [1920, 1080] {
+        [[1280, 720], [1129, 635], [960, 540]]
+    } else {
+        [[2560, 1440], [2258, 1270], [1920, 1080]]
+    };
+    for (mode, expected) in (1..=3).zip(expected_sizes) {
         resolution.quality = mode;
         assert_eq!(query(&mut context, &mut resolution.header), 0);
         assert_eq!([render_width, render_height], expected);
