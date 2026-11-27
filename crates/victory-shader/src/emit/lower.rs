@@ -349,6 +349,10 @@ struct Lower<'a> {
     /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
     /// IR block whether every lane runs it (exchanges need both halves there).
     exchange: Option<(u32, bool, Vec<bool>)>,
+    /// A console wave64 compute program run in host waves of 64 (the console wave whole, no
+    /// `exchange`): per IR block whether every lane runs it, where a ballot of a mask holding
+    /// lanes outside EXEC still sees all of them ([`Self::mask_dword`]).
+    whole_wave: Option<Vec<bool>>,
     /// With `exchange`: nothing is exchanged, each host wave acts as a wave
     /// of its own ([`with_local_waves`]).
     local: bool,
@@ -2198,6 +2202,19 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        // (the console wave whole in one host wave: `WaveSize(64)`, which a host of 32-lane
+        // waves refuses)
+        let whole_wave = match x.native.io {
+            StageIo::Cs(_)
+                if x.native.wave64
+                    && s.wave_size == Some(64)
+                    && exchange.is_none()
+                    && host_max_wave() != 32 =>
+            {
+                all_lane_blocks(x.st)
+            }
+            _ => None,
+        };
         Lower {
             s,
             x,
@@ -2280,6 +2297,7 @@ impl<'a> Lower<'a> {
                 }
                 _ => Default::default(),
             },
+            whole_wave,
             exchange,
             clane: None,
             pair: None,
@@ -4221,9 +4239,14 @@ impl<'a> Lower<'a> {
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
         // A mask that holds lanes outside EXEC where it is written (the complement of one,
         // say) is the ballot of the lanes that are there: all of them, where two exchanging
-        // host waves know every lane runs that block.
+        // host waves know every lane runs that block, or where a host wave holding the whole
+        // console wave does.
         let made = self.def_block.get(&lo).copied();
-        let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
+        let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b))
+            || self
+                .whole_wave
+                .as_ref()
+                .is_some_and(|all| made.is_none_or(|b| all.get(b).copied().unwrap_or(false)));
         if !self.x.st.active.contains(&lo) && !whole {
             // Bits taken out of a register that joins a lane mask and data,
             // lowered as the number it is (the ray tracer's SGPRs, reused

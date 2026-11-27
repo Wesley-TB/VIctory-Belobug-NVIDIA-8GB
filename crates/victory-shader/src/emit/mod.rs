@@ -664,6 +664,32 @@ pub fn emit(
             }
         }
     }
+    // The same on a host that runs the console wave whole (64 lanes): a mask holding lanes
+    // outside EXEC, read as data where not every lane runs, may be read where every lane does
+    // once the skips around it are left out ([`ir::without_skips`]; exact, no barrier).
+    if exact_only && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() >= 64 {
+        let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+        let forms = [
+            ("without skips", ir::without_skips(p, false)),
+            ("without skips, scalars followed", ir::without_skips(p, true)),
+        ];
+        for (name, f) in forms {
+            let Some(p) = f else { continue };
+            let Ok(st) = structure::structure(&p) else { continue };
+            let Ok(io) = io::raise(&p, native) else { continue };
+            let Ok(res) = resource::track(&p, &native.layout, native.stage, Some(&st)) else { continue };
+            let again = emit_program(c, native, &p, &st, &io, &res);
+            if why {
+                match &again {
+                    Ok((_, wave)) => eprintln!("WAVE64-RETRY {name}: wave {wave:?}"),
+                    Err(e) => eprintln!("WAVE64-RETRY {name}: {e}"),
+                }
+            }
+            if again.is_ok() {
+                return again.map(|(shader, _)| shader);
+            }
+        }
+    }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
     // lowering has named the skipped blocks).
