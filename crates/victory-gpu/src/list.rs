@@ -295,6 +295,96 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     }
 }
 
+/// The share of an aperture segment of the card's memory, in percent of its
+/// limit, from which idle host lists go (`VICTORY_LIST_TIGHT=N`, 50 to 95;
+/// off by default). A list's allocators keep their command memory over a
+/// reset, and on RDNA 2 that memory lies in a 2 GB aperture segment: run
+/// full, the video memory manager could not make a new list resident and
+/// the device was removed (kyokyotosh/VIctory-6700XT, `FINDINGS-6700XT.md`:
+/// 80 there; #329: 1.16 MiB a list).
+#[cfg(windows)]
+fn tight_percent() -> Option<u64> {
+    static PERCENT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        let set = std::env::var("VICTORY_LIST_TIGHT").ok().and_then(|v| v.trim().parse().ok());
+        set.map(|p: u64| p.clamp(50, 95))
+    })
+}
+
+/// Idle host lists a tight trim leaves.
+#[cfg(windows)]
+const TIGHT_KEEP: usize = 64;
+/// The fewest milliseconds between two tight trims: lists let go and made
+/// again cost the graphics kernel's time once in this at most (#335 cut the
+/// pool on every landing: 2.9 thousand lists made in a run became 116-142
+/// thousand, and the frame went from 34 to 74-83 ms).
+#[cfg(any(windows, test))]
+const TIGHT_EVERY_MS: u64 = 10_000;
+
+/// Whether `used` bytes of a segment's `limit` count as tight: over
+/// `percent`, and once they did, until under 10 points less.
+#[cfg(any(windows, test))]
+fn tight(was: bool, used: u64, limit: u64, percent: u64) -> bool {
+    let percent = if was { percent.saturating_sub(10) } else { percent };
+    limit > 0 && used.saturating_mul(100) > limit.saturating_mul(percent)
+}
+
+/// Whether a tight trim may run at `now`, the last one at `last` (0: none).
+#[cfg(any(windows, test))]
+fn trim_due(now: u64, last: u64) -> bool {
+    last == 0 || now.saturating_sub(last) >= TIGHT_EVERY_MS
+}
+
+/// From the once-a-second sweep: while the fullest aperture segment is
+/// tight, idle host lists past [`TIGHT_KEEP`] go, once in
+/// [`TIGHT_EVERY_MS`] at most.
+#[cfg(windows)]
+pub(crate) fn trim_when_tight() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    static TIGHT: AtomicBool = AtomicBool::new(false);
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let Some(percent) = tight_percent() else {
+        return;
+    };
+    let Some((used, limit)) = crate::host::host().and_then(|h| h.fullest_aperture()) else {
+        return;
+    };
+    let was = TIGHT.load(Relaxed);
+    let now_tight = tight(was, used, limit, percent);
+    TIGHT.store(now_tight, Relaxed);
+    if now_tight != was {
+        tracing::info!(
+            tight = now_tight,
+            resident_mb = used >> 20,
+            limit_mb = limit >> 20,
+            "an aperture segment of the card's memory {} its tight share ({percent}% in, {}% out)",
+            if now_tight { "passed" } else { "fell below" },
+            percent.saturating_sub(10)
+        );
+    }
+    let now = crate::host::now_ms().max(1);
+    if !now_tight || !trim_due(now, LAST.load(Relaxed)) {
+        return;
+    }
+    let gone: Vec<Idle> = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let keep = idle.0.len().min(TIGHT_KEEP);
+        let gone = idle.0.split_off(keep);
+        idle.1 -= gone.iter().map(|Idle(_, bytes)| bytes).sum::<u64>();
+        gone
+    };
+    if gone.is_empty() {
+        return;
+    }
+    LAST.store(now, Relaxed);
+    tracing::info!(lists = gone.len(), kept = TIGHT_KEEP, "idle host lists let go: an aperture segment is tight");
+    // Off the submitting thread: freeing lists takes the graphics kernel's
+    // time. (Idle lists have run and been reset; nothing names them.)
+    let _ = std::thread::Builder::new()
+        .name("victory-list-trim".into())
+        .spawn(move || drop(gone));
+}
+
 /// A wait for a memory value recorded into list `this`, with waits cut
 /// into lists (`crate::queue::cuts`). On the console the queue runs the
 /// list up to the wait, stands there until the value is in memory, and
@@ -2389,6 +2479,26 @@ static NEWER_THIN_FUNCTIONS: Table<160> = Table(thin::table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn tight_has_hysteresis_and_trims_are_spaced() {
+        let limit = 2048 << 20;
+        let at = |percent: u64| limit / 100 * percent;
+        // In over 80, not at it.
+        assert!(!tight(false, at(80), limit, 80));
+        assert!(tight(false, at(81), limit, 80));
+        // Out only under 70.
+        assert!(tight(true, at(75), limit, 80));
+        assert!(tight(true, at(71), limit, 80));
+        assert!(!tight(true, at(70), limit, 80));
+        // No limit read: never tight.
+        assert!(!tight(false, 1, 0, 80));
+        assert!(!tight(true, 1, 0, 80));
+        // The first trim at once, then one in TIGHT_EVERY_MS.
+        assert!(trim_due(5, 0));
+        assert!(!trim_due(5 + TIGHT_EVERY_MS - 1, 5));
+        assert!(trim_due(5 + TIGHT_EVERY_MS, 5));
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

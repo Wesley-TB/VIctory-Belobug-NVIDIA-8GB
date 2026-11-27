@@ -559,6 +559,7 @@ fn sweep() {
     if crate::residency::pressured() {
         trim_spare_chunks();
     }
+    crate::list::trim_when_tight();
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
@@ -10106,6 +10107,33 @@ impl Host {
             unsafe { self.adapter.as_ref()?.QueryVideoMemoryInfo(0, segment, &mut info) }.ok()?;
             Some(info)
         })
+    }
+
+    /// The fullest aperture segment of the adapter (PC memory the card
+    /// maps, which DXGI's budgets leave out) as the graphics kernel counts
+    /// it: the bytes resident in it, all processes', and its limit.
+    pub(crate) fn fullest_aperture(&self) -> Option<(u64, u64)> {
+        use windows::Wdk::Graphics::Direct3D::{
+            D3DKMT_QUERYSTATISTICS, D3DKMT_QUERYSTATISTICS_ADAPTER, D3DKMT_QUERYSTATISTICS_QUERY_SEGMENT,
+            D3DKMT_QUERYSTATISTICS_RESULT, D3DKMT_QUERYSTATISTICS_SEGMENT, D3DKMT_QUERYSTATISTICS_TYPE,
+            D3DKMTQueryStatistics,
+        };
+        // SAFETY: a plain query.
+        let luid = unsafe { self.adapter.as_ref()?.GetDesc1() }.ok()?.AdapterLuid;
+        let query = |kind: D3DKMT_QUERYSTATISTICS_TYPE, segment: u32| -> Option<D3DKMT_QUERYSTATISTICS_RESULT> {
+            let mut q = D3DKMT_QUERYSTATISTICS { Type: kind, AdapterLuid: luid, ..Default::default() };
+            q.Anonymous.QuerySegment = D3DKMT_QUERYSTATISTICS_QUERY_SEGMENT { SegmentId: segment };
+            // SAFETY: the kernel writes the result into the live structure.
+            unsafe { D3DKMTQueryStatistics((&raw mut q).cast_const()) }.is_ok().then_some(q.QueryResult)
+        };
+        // SAFETY: the member an adapter query fills.
+        let count = unsafe { query(D3DKMT_QUERYSTATISTICS_ADAPTER, 0)?.AdapterInformation.NbSegments };
+        (0..count)
+            // SAFETY: the member a segment query fills.
+            .filter_map(|id| query(D3DKMT_QUERYSTATISTICS_SEGMENT, id).map(|r| unsafe { r.SegmentInformation }))
+            .filter(|s| s.Aperture != 0 && s.CommitLimit > 0)
+            .map(|s| (s.BytesResident, s.CommitLimit))
+            .max_by_key(|&(used, limit)| used.saturating_mul(1000) / limit)
     }
 
     /// Both of the system's memory groups for this process, in bytes: for
