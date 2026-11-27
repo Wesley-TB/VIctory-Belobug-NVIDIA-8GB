@@ -59,17 +59,24 @@ impl Cache {
             .with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
         let dir = path.parent().expect("hashed path has a parent");
         std::fs::create_dir_all(dir)?;
-        // Write-then-rename so readers never see partial output.
-        let (tmp, mut file) = tempfile_in(dir)?;
-        let written = file.write_all(&output);
-        drop(file);
-        let published = written.and_then(|()| std::fs::rename(&tmp, &path));
-        if published.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        published?;
+        publish_bytes(&path, &output)?;
         Ok(path)
     }
+}
+
+/// Writes into a private staging file and renames it only after the write
+/// succeeds. The caller must create the parent and validate the destination
+/// against the asset policy.
+pub fn publish_bytes(path: &Path, output: &[u8]) -> io::Result<()> {
+    let dir = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
+    let (tmp, mut file) = tempfile_in(dir)?;
+    let written = file.write_all(output);
+    drop(file);
+    let published = written.and_then(|()| std::fs::rename(&tmp, path));
+    if published.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    published
 }
 
 fn tempfile_in(dir: &Path) -> io::Result<(PathBuf, File)> {

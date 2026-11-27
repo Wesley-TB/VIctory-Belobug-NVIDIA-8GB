@@ -1,5 +1,6 @@
 //! A store of the larger levels of textures the title streams
-//! (`VICTORY_TEXTURE_STORE=<folder>`; off).
+//! (`VICTORY_TEXTURE_STORE=1` for the configured cache's `textures`
+//! subdirectory, or a folder outside the source tree; off by default).
 //!
 //! The title streams a texture's levels smallest first, and views it from
 //! the first level it holds: a new texture is blurred until its larger
@@ -24,8 +25,9 @@
 //! A texture shown wrong would be one of two such. Files are never trimmed.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
@@ -85,12 +87,45 @@ fn parse_line(line: &str) -> Option<(Key, Entry)> {
     Some((Key { shape, level, digest }, Entry { blob, levels }))
 }
 
+fn prepare_folder(
+    setting: &OsStr,
+    cache_dir: impl FnOnce() -> anyhow::Result<PathBuf>,
+) -> anyhow::Result<PathBuf> {
+    let folder = if setting == "1" {
+        cache_dir()?.join("textures")
+    } else {
+        PathBuf::from(setting)
+    };
+    victory_core::ensure_outside_repo(&folder)?;
+    victory_core::ensure_outside_repo(&folder.join("index.txt"))?;
+    std::fs::create_dir_all(&folder)?;
+    Ok(std::fs::canonicalize(folder)?)
+}
+
+/// Publishes a complete blob before its keys go into the disk index.
+/// Returns whether this call wrote bytes.
+fn publish_blob(folder: &Path, blob: u128, bytes: &[u8]) -> anyhow::Result<bool> {
+    let path = folder.join(format!("{blob:032x}.lv"));
+    if path.is_file() {
+        return Ok(false);
+    }
+    victory_core::ensure_outside_repo(&path)?;
+    victory_pipeline::publish_bytes(&path, bytes)?;
+    Ok(true)
+}
+
 fn store() -> Option<&'static Store> {
     static STORE: OnceLock<Option<Store>> = OnceLock::new();
     STORE
         .get_or_init(|| {
-            let folder = PathBuf::from(std::env::var_os("VICTORY_TEXTURE_STORE").filter(|v| !v.is_empty() && v != "0")?);
-            std::fs::create_dir_all(&folder).ok()?;
+            let setting = std::env::var_os("VICTORY_TEXTURE_STORE").filter(|v| !v.is_empty() && v != "0")?;
+            let folder = match prepare_folder(&setting, || Ok(victory_core::Config::load()?.cache_dir)) {
+                Ok(folder) => folder,
+                Err(error) => {
+                    tracing::warn!(?setting, %error, "texture store disabled");
+                    return None;
+                }
+            };
             let mut index = HashMap::new();
             if let Ok(text) = std::fs::read_to_string(folder.join("index.txt")) {
                 for (key, entry) in text.lines().filter_map(parse_line) {
@@ -122,13 +157,17 @@ fn store() -> Option<&'static Store> {
                         let Some((blob, bytes, keys)) = kept(store, job) else {
                             continue;
                         };
-                        let path = to.join(format!("{blob:032x}.lv"));
-                        if !path.exists() {
-                            let part = to.join(format!("{blob:032x}.part"));
-                            if std::fs::write(&part, &bytes[..]).is_err() || std::fs::rename(&part, &path).is_err() {
+                        match publish_blob(&to, blob, &bytes) {
+                            Ok(true) => {
+                                STATS[5].fetch_add(bytes.len() as u64, Relaxed);
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                if error.is::<victory_core::PolicyError>() {
+                                    tracing::warn!(%error, "texture store refused a blob destination");
+                                }
                                 continue;
                             }
-                            STATS[5].fetch_add(bytes.len() as u64, Relaxed);
                         }
                         let text: String = keys.iter().map(|(k, e)| line_of(k, e) + "\n").collect();
                         let _ = index.write_all(text.as_bytes());
@@ -281,6 +320,52 @@ pub(crate) static PREFILLED: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn texture_store_uses_the_configured_cache_or_an_explicit_folder() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let actual = prepare_folder(OsStr::new("1"), || Ok(cache.clone())).unwrap();
+        assert_eq!(actual, cache.join("textures").canonicalize().unwrap());
+
+        let custom = temp.path().join("custom");
+        let actual = prepare_folder(custom.as_os_str(), || panic!("explicit path needs no cache config")).unwrap();
+        assert_eq!(actual, custom.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn texture_store_rejects_a_source_tree_before_creating_the_folder() {
+        let clone = tempfile::tempdir().unwrap();
+        std::fs::write(clone.path().join(".victory-root"), []).unwrap();
+        let custom = clone.path().join("custom");
+        let error = prepare_folder(custom.as_os_str(), || unreachable!()).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<victory_core::PolicyError>(),
+            Some(victory_core::PolicyError::InsideRepo { .. })
+        ));
+        assert!(!custom.exists());
+
+        let cache = clone.path().join("cache");
+        assert!(prepare_folder(OsStr::new("1"), || Ok(cache.clone())).is_err());
+        assert!(!cache.exists());
+    }
+
+    #[test]
+    fn publishing_a_blob_leaves_another_writers_staging_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = 1u128;
+        let part = dir.path().join(format!("{blob:032x}.part"));
+        let path = dir.path().join(format!("{blob:032x}.lv"));
+        let bytes = vec![0x4c; 512 * 1024];
+        std::fs::write(&part, b"another writer").unwrap();
+
+        assert!(publish_blob(dir.path(), blob, &bytes).unwrap());
+        assert_eq!(std::fs::read(&part).unwrap(), b"another writer");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(!publish_blob(dir.path(), blob, b"later duplicate").unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
 
     #[test]
     fn index_lines_read_back() {
