@@ -47,6 +47,7 @@ the frame now is the one thread that submits the title's work to the card
 | Radeon RX 9060 XT (16 GB), `cd8dfc0` with local changes | In the same Series X interior at 1080p, the game averaged 19.8 fps with ray tracing off and 15.6 fps with it on. Indirect lighting showed white patches and dark smears. [Run settings and results](https://github.com/Belobug/VIctory-Belobug-AMD/issues/313) |
 | GeForce RTX 3090 (24 GB), `a-publier@cd8dfc0` | The prison rendered. Two warm Series S runs averaged 545 and 532 ms per frame. The contributor reported 10.0 and 10.2 GB of VRAM in those runs. [Run settings and results](https://github.com/Belobug/VIctory-Belobug-AMD/issues/333) |
 | Intel Arc B580 (12 GB), revision unreported | Startup and initial menu navigation worked. Further menu interaction slowed to about 0.7 fps before D3D12 device removal. [Crash report](https://github.com/Belobug/VIctory-Belobug-AMD/issues/98) |
+| GeForce RTX 4070 Ti (12 GB), `a-publier@4eb6cfd` with `VICTORY_NULL_GUARD=1` | Without the guard, every start ended after the start screen's A with a read of 0x38 (7 runs of 7). With it, the title went on into the game: 1.6 fps (630 ms a frame) in the first run, with 1,000-3,000 draws a frame waiting for pipelines the driver was still making, and 7.4 GB in use of a 7.6 GB video memory budget. |
 
 The 10.5 GB of VRAM in the RX 7900 XTX table is the usage reported for that run.
 Memory use and frame time depend on the scene and settings. The [ray-tracing notes](docs/fork-ray-tracing.md)
@@ -72,6 +73,8 @@ describe which lighting paths run and the remaining rendering issues.
 | `VICTORY_AMBIENT_SETTLE` | How fast light settles after walking indoors (on by default, `250,3`; `0` turns it off) |
 | `VICTORY_TEXTURE_STORE=1` | Keep converted textures in the configured cache's `textures` folder (off by default). For a custom folder, set `VICTORY_TEXTURE_STORE` to a path outside the source tree. |
 | `VICTORY_KBM_GTA=1` | Optional GTA V PC-style keyboard and mouse mapping on the stand-in pad: `F2` or `` ` `` (`~`) toggles mouse-look and auto-hides the cursor while locked (`Esc`/`P`/focus loss unlocks and restores it), LMB/RMB = RT/LT, MMB/`C` = R3, `Shift` = A, `Space` = X, `R` = B, `F` = Y, `Tab` = LB, `Q` = RB, `Ctrl` = L3, `E` = D-pad Right, `V` = View. Tune with `VICTORY_MOUSE_SENS` (default `1.0`) and `VICTORY_MOUSE_INVERT_Y=1` (or pass via `scripts\play.ps1 -More @{VICTORY_KBM_GTA='1'}`) |
+| `VICTORY_NULL_GUARD=1` | A null check the title leaves out at start-up: on an RTX 4070 Ti, a start-up lookup finds nothing and every start ended after the start screen's A; with it the title goes on into the game (why the lookup finds nothing is not known yet) |
+| `VICTORY_LOCALE=en-US`, `VICTORY_GEO=US` | The locale and region the title is told, in place of the PC's (to see whether a start depends on them) |
 
 What is known to be wrong:
 

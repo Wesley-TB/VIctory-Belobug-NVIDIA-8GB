@@ -243,6 +243,13 @@ pub fn run(
         // SAFETY: the image stays mapped and nothing of it has run yet.
         unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
     }
+    // VICTORY_NULL_GUARD=1: a null check the title leaves out (off without it).
+    #[cfg(windows)]
+    if execute {
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped and nothing of it has run yet.
+        unsafe { victory_loader::null_guard::apply_asked(image.base(), size) };
+    }
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());

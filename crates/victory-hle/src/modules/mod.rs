@@ -25,6 +25,8 @@ pub mod kernel;
 #[cfg(windows)]
 pub mod lifecycle;
 #[cfg(windows)]
+pub mod locale;
+#[cfg(windows)]
 pub mod media;
 #[cfg(windows)]
 pub mod net;
@@ -67,6 +69,10 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(files::module());
     #[cfg(windows)]
     all.push(lifecycle::module());
+    #[cfg(windows)]
+    if locale::serving() {
+        all.push(locale::module());
+    }
     #[cfg(windows)]
     all.push(net::module());
     all.push(rpcrt4::module());
