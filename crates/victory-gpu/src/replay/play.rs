@@ -333,7 +333,7 @@ fn median(v: &[f64]) -> f64 {
 /// The folder of a capture: `folder`, or the last `capture-<n>` in it that
 /// is complete.
 pub fn find(folder: &Path) -> Result<PathBuf> {
-    if folder.join("frame.bin").exists() {
+    if folder.join("frame.bin").is_file() {
         return Ok(folder.to_owned());
     }
     let mut best: Option<(u32, PathBuf)> = None;
@@ -345,7 +345,7 @@ pub fn find(folder: &Path) -> Result<PathBuf> {
         let Some(n) = name.strip_prefix("capture-").and_then(|n| n.parse().ok()) else {
             continue;
         };
-        if entry.path().join("frame.bin").exists() && best.as_ref().is_none_or(|b| b.0 < n) {
+        if entry.path().join("frame.bin").is_file() && best.as_ref().is_none_or(|b| b.0 < n) {
             best = Some((n, entry.path()));
         }
     }
@@ -3540,6 +3540,23 @@ fn debug_messages(q: &ID3D12InfoQueue) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_discovery_skips_directories_named_frame_bin() {
+        let dir = tempfile::tempdir().unwrap();
+        let older = dir.path().join("capture-2");
+        let newer = dir.path().join("capture-3");
+        std::fs::create_dir(dir.path().join("frame.bin")).unwrap();
+        std::fs::create_dir(&older).unwrap();
+        std::fs::write(older.join("frame.bin"), []).unwrap();
+        std::fs::create_dir_all(newer.join("frame.bin")).unwrap();
+        assert_eq!(find(dir.path()).unwrap(), older);
+        assert_eq!(find(&older).unwrap(), older);
+
+        std::fs::remove_dir(newer.join("frame.bin")).unwrap();
+        std::fs::write(newer.join("frame.bin"), []).unwrap();
+        assert_eq!(find(dir.path()).unwrap(), newer);
+    }
 
     #[test]
     fn captures_are_found() {
